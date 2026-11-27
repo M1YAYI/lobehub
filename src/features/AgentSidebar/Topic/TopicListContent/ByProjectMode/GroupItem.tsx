@@ -1,0 +1,510 @@
+import { AGENT_CHAT_URL } from '@lobechat/const';
+import {
+  AccordionHeader,
+  AccordionItem,
+  AccordionPanel,
+  accordionStyles,
+  AccordionTrigger,
+  ActionIcon,
+  Center,
+  cssVar,
+  cx,
+  type DropdownItem,
+  DropdownMenu,
+  Flexbox,
+  Icon,
+  Tag,
+  Text,
+} from '@lobehub/ui';
+import isEqual from 'fast-deep-equal';
+import {
+  Archive,
+  FolderClosedIcon,
+  FolderOpenIcon,
+  LaptopIcon,
+  ListFilter,
+  LucideCheck,
+  PlusIcon,
+} from 'lucide-react';
+import { memo, useCallback, useMemo } from 'react';
+import { useTranslation } from 'react-i18next';
+
+import { useActiveWorkspaceId } from '@/business/client/hooks/useActiveWorkspaceId';
+import { useActiveWorkspaceSlug } from '@/business/client/hooks/useActiveWorkspaceSlug';
+import TailMarquee from '@/components/TailMarquee';
+import { useCommitWorkingDirectory } from '@/features/ChatInput/ControlBar/useCommitWorkingDirectory';
+import { useNavItemMetrics } from '@/features/NavPanel/density';
+import ProjectAvatar from '@/features/Projects/ProjectAvatar';
+import { AgentDirectoryActions } from '@/features/Projects/WorkingDirectories/AgentDirectoryActions';
+import { canStageDraftOn } from '@/features/Projects/WorkingDirectories/startProjectTopicDraft';
+import { useAgentFixedDeviceId } from '@/features/Projects/WorkingDirectories/useAgentFixedDeviceId';
+import {
+  useWorkspaceAwareNavigate,
+  type WorkspaceAwareNavigateFunction,
+} from '@/features/Workspace/useWorkspaceAwareNavigate';
+import { buildWorkspaceAwarePath } from '@/features/Workspace/workspaceAwarePath';
+import { resolveTargetDeviceId } from '@/helpers/agentWorkingDirectory';
+import { useActiveLocation } from '@/hooks/useActiveLocation';
+import { useActiveRouteParams } from '@/hooks/useActiveRouteParams';
+import { useEffectiveAgencyConfig } from '@/hooks/useEffectiveAgencyConfig';
+import { usePermission } from '@/hooks/usePermission';
+import { useQueryRoute } from '@/hooks/useQueryRoute';
+import { useAgentStore } from '@/store/agent';
+import { useChatStore } from '@/store/chat';
+import { deviceSelectors, useDeviceStore } from '@/store/device';
+import { useElectronStore } from '@/store/electron';
+import { useGlobalStore } from '@/store/global';
+import { type ProjectTopicSubGroupMode } from '@/store/global/initialState';
+import { systemStatusSelectors } from '@/store/global/selectors';
+import { useProjectDirectories, useProjectDirectoryStore } from '@/store/projectWorkingDirectory';
+import { useUserStore } from '@/store/user';
+import { userProfileSelectors } from '@/store/user/selectors';
+import { getTopicWorkingDirectorySourcePath } from '@/utils/client/topic';
+
+import { buildPrefixedAgentRoutePath, parseAgentPathname } from '../../../utils/agentPathname';
+import { archiveMergedPullRequestTopics } from '../../archiveMergedPullRequestTopics';
+import { useTopicListScope } from '../../TopicListScope';
+import { type GroupItemComponentProps } from '../GroupedAccordion';
+import { useStartTopicInDirectory } from '../useStartTopicInDirectory';
+import { indicatorStyles, useCollapsedIndicators } from './CollapsedIndicators';
+import { deviceCategoryKey, deviceDisplayName } from './deviceIdentity';
+import ProjectTopicList from './ProjectTopicList';
+
+const PROJECT_GROUP_PREFIX = 'project:';
+const PROJECT_ID_GROUP_PREFIX = 'project-id:';
+const SUB_GROUP_MODES: ProjectTopicSubGroupMode[] = ['none', 'byDevice', 'byTime', 'byStatus'];
+// One directory lives on one device, so sectioning it by device would only
+// nest the device under its own folder — devices lead in the sidebar's own
+// "by device" grouping instead. A project spans directories on several
+// machines, and a folder can merge one machine's personal and workspace
+// identities; only those section by device.
+const FOLDER_SUB_GROUP_MODES = SUB_GROUP_MODES.filter((mode) => mode !== 'byDevice');
+
+/**
+ * Keeps the device list synced from a leaf that renders nothing. The sync hook
+ * re-renders its caller on every revalidation, which a topic switch can start;
+ * calling it in the group body re-rendered every group with it.
+ */
+const DeviceListSync = memo(() => {
+  useDeviceStore((s) => s.useFetchDevices)(true);
+  return null;
+});
+
+DeviceListSync.displayName = 'TopicByProjectDeviceListSync';
+
+interface GroupItemBodyProps extends GroupItemComponentProps {
+  navigate: WorkspaceAwareNavigateFunction;
+  /** Path prefix in front of `/agent/...` (e.g. a popup route), kept on new-topic navigation. */
+  routePrefix: string | undefined;
+  router: ReturnType<typeof useQueryRoute>;
+  /** The agent this sidebar belongs to: the route's agent, else the active one. */
+  targetAgentId: string | undefined;
+}
+
+const GroupItemBody = memo<GroupItemBodyProps>((props) => {
+  const { group, expanded, navigate, router, routePrefix, targetAgentId } = props;
+  const { id, title, children, deviceId: groupDeviceId } = group;
+  const metrics = useNavItemMetrics();
+  const scope = useTopicListScope();
+  // `project-id:` groups merge every directory of one project — resolve the
+  // project through any of its directories; directory/path groups keep the
+  // first child's exact directory so a shared path can't cross projects.
+  const projectId = id.startsWith(PROJECT_ID_GROUP_PREFIX)
+    ? id.slice(PROJECT_ID_GROUP_PREFIX.length)
+    : undefined;
+  useProjectDirectoryStore((s) => s.useFetchDirectories)(
+    undefined,
+    !!children[0]?.projectWorkingDirectoryId || !!projectId,
+  );
+  const directories = useProjectDirectories();
+  const project = projectId
+    ? directories.find((d) => d.projectId === projectId)
+    : directories.find((d) => d.id === children[0]?.projectWorkingDirectoryId);
+  const projectDirectories = useMemo(
+    () => (projectId ? directories.filter((d) => d.projectId === projectId) : []),
+    [directories, projectId],
+  );
+
+  const workingDirectory = useMemo(
+    () =>
+      (children[0] ? getTopicWorkingDirectorySourcePath(children[0]) : undefined) ??
+      (id.startsWith(PROJECT_GROUP_PREFIX) ? id.slice(PROJECT_GROUP_PREFIX.length) : undefined),
+    [id, children],
+  );
+
+  const currentAgentId = targetAgentId;
+  const agentRoute = useMemo(
+    () => (routePrefix ? { prefix: routePrefix } : undefined),
+    [routePrefix],
+  );
+  const activeWorkspaceSlug = useActiveWorkspaceSlug();
+  // `null`: the group "+" starts a new conversation, so the write targets the
+  // agent default, never the device bound to whichever topic is open.
+  const { commitAgentDefault } = useCommitWorkingDirectory(currentAgentId ?? '', null);
+
+  const handleAddTopic = useCallback(
+    async (projectWorkingDirectoryId?: string) => {
+      if (!workingDirectory || !currentAgentId || !targetAgentId) return;
+      // Write the agent's per-device default so the new topic inherits this
+      // directory at creation time — the same high-precedence slot the picker
+      // uses, not the legacy per-agent fallback that gets shadowed by it.
+      await commitAgentDefault(workingDirectory);
+      useChatStore.getState().switchTopic(null, { skipRefreshMessage: true });
+      // No topic row is created here — the first message creates it. Stage the
+      // project directory so that creation binds the deferred row to the
+      // project (list, sidebar grouping and execution routing), instead of
+      // dropping it into a path-only conversation.
+      useChatStore
+        .getState()
+        .setPendingNewTopicDirectory(
+          projectWorkingDirectoryId
+            ? { agentId: targetAgentId, projectWorkingDirectoryId }
+            : undefined,
+        );
+      router.push(
+        buildPrefixedAgentRoutePath(AGENT_CHAT_URL(targetAgentId), agentRoute, activeWorkspaceSlug),
+      );
+    },
+    [
+      workingDirectory,
+      currentAgentId,
+      targetAgentId,
+      commitAgentDefault,
+      router,
+      agentRoute,
+      activeWorkspaceSlug,
+    ],
+  );
+
+  // A merged project group may span several machines, so there is no single
+  // directory to commit to the agent. It still has to open the blank composer
+  // INSIDE the project: stage one runnable directory — the agent's current
+  // device first — so the first send binds the new topic to the project, and
+  // let the user move to another machine in the composer's device switcher.
+  // Staging nothing (the old behaviour) dropped the topic into a path-only
+  // conversation, detached from the project the "+" belonged to. No directory
+  // can run it → fall back to the plain composer, as before.
+  const fixedDeviceId = useAgentFixedDeviceId(targetAgentId);
+  const { agencyConfig, workspaceScoped } = useEffectiveAgencyConfig(targetAgentId ?? '', {
+    topicId: null,
+  });
+  const currentDeviceId = useElectronStore((s) => s.gatewayDeviceInfo?.deviceId);
+  const handleStartPlain = useCallback(() => {
+    if (!currentAgentId || !targetAgentId) return;
+    const runnable = projectDirectories.filter((d) => canStageDraftOn(d, fixedDeviceId));
+    const preferredDeviceId = resolveTargetDeviceId(agencyConfig, currentDeviceId, {
+      workspaceScoped,
+    });
+    const stagedDirectory =
+      runnable.find((d) => preferredDeviceId && d.deviceId === preferredDeviceId) ?? runnable[0];
+    useChatStore.getState().switchTopic(null, { skipRefreshMessage: true });
+    useChatStore
+      .getState()
+      .setPendingNewTopicDirectory(
+        stagedDirectory
+          ? { agentId: targetAgentId, projectWorkingDirectoryId: stagedDirectory.id }
+          : undefined,
+      );
+    router.push(
+      buildPrefixedAgentRoutePath(AGENT_CHAT_URL(targetAgentId), agentRoute, activeWorkspaceSlug),
+    );
+  }, [
+    currentAgentId,
+    targetAgentId,
+    projectDirectories,
+    fixedDeviceId,
+    agencyConfig,
+    currentDeviceId,
+    workspaceScoped,
+    router,
+    agentRoute,
+    activeWorkspaceSlug,
+  ]);
+
+  // Start on one specific project directory — the device sub-group "+".
+  const { startInDirectory: handleStartInDirectory } = useStartTopicInDirectory();
+
+  const canAddTopic = !scope && !!currentAgentId && !!workingDirectory;
+  const needsPlainStart = !!projectId && projectDirectories.length > 1;
+  const { t: tProject } = useTranslation('project');
+
+  const isProjectGroup = !!projectId || !!children[0]?.projectWorkingDirectoryId;
+  const spansDevices =
+    new Set(children.map((topic) => topic.metadata?.boundDeviceId).filter(Boolean)).size > 1;
+  const subGroupModes = projectId || spansDevices ? SUB_GROUP_MODES : FOLDER_SUB_GROUP_MODES;
+
+  // The same folder on another machine is its own group with the same name:
+  // name the device, and its category for one machine's several identities.
+  // Select strings, not the list: every device-list revalidation writes a new
+  // array, and each switch to a topic on another device triggers one.
+  const deviceName = useDeviceStore((s) =>
+    groupDeviceId ? deviceDisplayName(groupDeviceId, deviceSelectors.deviceList(s)) : undefined,
+  );
+  const deviceCategory = useDeviceStore((s) =>
+    groupDeviceId
+      ? deviceCategoryKey(groupDeviceId, deviceSelectors.deviceList(s), currentDeviceId)
+      : undefined,
+  );
+  const { t: tChat } = useTranslation('chat');
+  const deviceLabel =
+    deviceName && deviceCategory ? `${deviceName} · ${tChat(deviceCategory)}` : deviceName;
+  const storedSubGroupMode = useGlobalStore(systemStatusSelectors.projectTopicSubGroupMode(id));
+  const subGroupMode = subGroupModes.includes(storedSubGroupMode) ? storedSubGroupMode : 'none';
+  const updateSystemStatus = useGlobalStore((s) => s.updateSystemStatus);
+  const subGroupMenuItems = useMemo<DropdownItem[]>(
+    () => [
+      {
+        children: subGroupModes.map((mode) => ({
+          icon: subGroupMode === mode ? <Icon icon={LucideCheck} /> : <div />,
+          key: `sub-group-${mode}`,
+          label: tProject(`topics.subGroup.${mode}`),
+          onClick: () => updateSystemStatus({ projectTopicSubGroupModeByGroup: { [id]: mode } }),
+        })),
+        key: 'sub-group',
+        label: tProject('topics.subGroup.title'),
+        type: 'group',
+      },
+    ],
+    [id, subGroupModes, subGroupMode, tProject, updateSystemStatus],
+  );
+
+  // "Archive merged PR topics", scoped to this group — a workspace member only
+  // archives their own topics, same as the sidebar-wide action.
+  const { t } = useTranslation('topic');
+  const activeWorkspaceId = useActiveWorkspaceId();
+  const currentUserId = useUserStore(userProfileSelectors.userId);
+  const { allowed: canEditTopic } = usePermission('edit_own_content');
+  const archiveMenuItems = useMemo<DropdownItem[]>(
+    () => [
+      {
+        disabled: !canEditTopic,
+        icon: <Icon icon={Archive} />,
+        key: 'archiveMergedPullRequests',
+        label: t(
+          activeWorkspaceId
+            ? 'actions.archiveMergedPullRequestsOwn'
+            : 'actions.archiveMergedPullRequests',
+        ),
+        onClick: () =>
+          archiveMergedPullRequestTopics({
+            ownerId: activeWorkspaceId ? (currentUserId ?? null) : undefined,
+            t,
+            topics: children,
+          }),
+      },
+    ],
+    [activeWorkspaceId, canEditTopic, children, currentUserId, t],
+  );
+
+  const { hasIndicators: hasCollapsedIndicators, indicators } = useCollapsedIndicators(
+    children,
+    expanded,
+  );
+  const ProjectFolderIcon = expanded ? FolderOpenIcon : FolderClosedIcon;
+  // Sub-grouping is its own row action: it needs no directory, so it stays
+  // available even when the directory actions below can't render. The buttons
+  // collapse to zero width until the row is hovered, so a resting title gets
+  // the full row instead of a gap reserved for invisible actions.
+  const action = (
+    <Flexbox horizontal align={'center'} gap={4}>
+      {indicators}
+      <span className={indicatorStyles.hoverActions}>
+        <DropdownMenu items={subGroupMenuItems}>
+          <ActionIcon
+            icon={ListFilter}
+            size={'small'}
+            title={tProject('topics.subGroup.title')}
+            onClick={(e) => e.stopPropagation()}
+          />
+        </DropdownMenu>
+        {!canAddTopic ? null : needsPlainStart ? (
+          <>
+            <AgentDirectoryActions
+              hideStartAction
+              agentId={currentAgentId!}
+              extraMenuItems={archiveMenuItems}
+              path={workingDirectory!}
+              topics={children}
+              onLegacyStart={handleAddTopic}
+            />
+            <ActionIcon
+              icon={PlusIcon}
+              size={'small'}
+              title={tProject('directories.start')}
+              onClick={(e) => {
+                e.stopPropagation();
+                handleStartPlain();
+              }}
+            />
+          </>
+        ) : (
+          <AgentDirectoryActions
+            agentId={currentAgentId!}
+            extraMenuItems={archiveMenuItems}
+            path={workingDirectory!}
+            pathOnly={!isProjectGroup}
+            topics={children}
+            onLegacyStart={handleAddTopic}
+          />
+        )}
+      </span>
+    </Flexbox>
+  );
+
+  return (
+    <AccordionItem value={id}>
+      <AccordionHeader className={'accordion-header'}>
+        <AccordionTrigger style={{ paddingBlock: 4, paddingInline: 4 }}>
+          <Flexbox
+            horizontal
+            align="center"
+            gap={metrics.gap}
+            height={24}
+            style={{ overflow: 'hidden' }}
+          >
+            {groupDeviceId && <DeviceListSync />}
+            <Center flex="none" height={24} width={metrics.iconBox}>
+              {project ? (
+                <ProjectAvatar
+                  avatar={project.projectAvatar}
+                  id={project.projectId}
+                  name={project.projectName}
+                  size={18}
+                />
+              ) : (
+                <Icon
+                  color={cssVar.colorTextTertiary}
+                  icon={ProjectFolderIcon}
+                  size={{ size: 15, strokeWidth: 1.5 }}
+                />
+              )}
+            </Center>
+            {project ? (
+              <Text
+                ellipsis
+                fontSize={metrics.fontSize}
+                style={{ color: cssVar.colorText, flex: 1 }}
+              >
+                {scope ? (
+                  title
+                ) : (
+                  <a
+                    style={{ color: 'inherit', textDecoration: 'none' }}
+                    href={buildWorkspaceAwarePath(
+                      `/project/${project.projectSlug ?? project.projectId}`,
+                      activeWorkspaceSlug,
+                    )}
+                    onClick={(event) => {
+                      // Keep the accordion closed either way; leave modified clicks
+                      // (new tab / window) to the browser's native link handling.
+                      event.stopPropagation();
+                      if (
+                        event.button !== 0 ||
+                        event.metaKey ||
+                        event.ctrlKey ||
+                        event.shiftKey ||
+                        event.altKey
+                      )
+                        return;
+                      event.preventDefault();
+                      navigate(`/project/${project.projectSlug ?? project.projectId}`);
+                    }}
+                  >
+                    {project.projectName}
+                  </a>
+                )}
+              </Text>
+            ) : (
+              // A bare path reads from its end: keep the tail in view and
+              // scroll to the head on hover.
+              <TailMarquee
+                style={{
+                  color: cssVar.colorTextSecondary,
+                  fontSize: metrics.fontSize,
+                  // Beside a device tag, hug the name instead of filling the row,
+                  // so it stays next to its icon and the tag follows it.
+                  ...(deviceLabel && { flex: '0 1 auto' }),
+                }}
+              >
+                {title}
+              </TailMarquee>
+            )}
+            {deviceLabel && (
+              // The folder name stays readable: the device tag takes nearly all
+              // the shrinking when the row is tight; an overflowing label reads
+              // from its category end and scrolls to the device name on hover,
+              // like the folder path beside it.
+              <Tag
+                size={'small'}
+                style={{
+                  color: cssVar.colorTextDescription,
+                  flex: '0 100 auto',
+                  fontSize: 10,
+                  // A long path title still leaves the icon and a few letters.
+                  minWidth: 48,
+                  overflow: 'hidden',
+                }}
+              >
+                <Flexbox horizontal align={'center'} gap={3} style={{ minWidth: 0 }}>
+                  <Icon icon={LaptopIcon} size={{ size: 10 }} style={{ flex: 'none' }} />
+                  <TailMarquee>{deviceLabel}</TailMarquee>
+                </Flexbox>
+              </Tag>
+            )}
+          </Flexbox>
+        </AccordionTrigger>
+        <div
+          className={cx(
+            'accordion-action',
+            accordionStyles.action,
+            accordionStyles.actionBorderless,
+            hasCollapsedIndicators && accordionStyles.actionAlwaysVisible,
+          )}
+        >
+          {action}
+        </div>
+      </AccordionHeader>
+      <AccordionPanel contentStyle={{ padding: 0 }}>
+        <ProjectTopicList
+          mode={subGroupMode}
+          startAgentId={targetAgentId}
+          startDirectories={projectId ? projectDirectories : project ? [project] : undefined}
+          topics={children}
+          onStartInDirectory={!scope && targetAgentId ? handleStartInDirectory : undefined}
+        />
+      </AccordionPanel>
+    </AccordionItem>
+  );
+}, isEqual);
+
+GroupItemBody.displayName = 'TopicByProjectGroupItemBody';
+
+/**
+ * Reads the route for the group body. React Router's location, params and
+ * navigate contexts change on every navigation, including each topic switch;
+ * reading them here and passing primitives (plus stable navigate functions)
+ * keeps the heavy body behind its memo boundary.
+ */
+const GroupItem = memo<GroupItemComponentProps>(({ group, expanded }) => {
+  const navigate = useWorkspaceAwareNavigate();
+  const router = useQueryRoute();
+  const activeAgentId = useAgentStore((s) => s.activeAgentId);
+  const { aid: routeAgentId } = useActiveRouteParams<{ aid?: string }>();
+  const { pathname } = useActiveLocation();
+  const agentRoute = parseAgentPathname(pathname);
+
+  return (
+    <GroupItemBody
+      expanded={expanded}
+      group={group}
+      navigate={navigate}
+      routePrefix={agentRoute?.prefix}
+      router={router}
+      targetAgentId={routeAgentId ?? agentRoute?.agentId ?? activeAgentId}
+    />
+  );
+});
+
+GroupItem.displayName = 'TopicByProjectGroupItem';
+
+export default GroupItem;

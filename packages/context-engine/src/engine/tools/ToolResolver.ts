@@ -1,0 +1,184 @@
+import { ToolNameResolver } from './ToolNameResolver';
+import type {
+  ActivatedStepTool,
+  LobeToolManifest,
+  OperationToolSet,
+  ResolvedToolSet,
+  StepToolDelta,
+  ToolExecutor,
+  ToolSource,
+  UniformTool,
+} from './types';
+import { generateToolsFromManifest } from './utils';
+
+/**
+ * Unified tool resolution engine.
+ *
+ * Single entry-point that merges operation-level tools with step-level
+ * dynamic activations (device, @tool mentions, LLM discovery, etc.)
+ * and produces the final `ResolvedToolSet` consumed by `call_llm`.
+ */
+export class ToolResolver {
+  /**
+   * Resolve the final tool set for an LLM call.
+   *
+   * @param operationToolSet  Immutable tools determined at operation creation
+   * @param stepDelta         Declarative tool changes for the current step
+   * @param accumulatedActivations  Tools activated in previous steps (cumulative)
+   */
+  resolve(
+    operationToolSet: OperationToolSet,
+    stepDelta: StepToolDelta,
+    accumulatedActivations: ActivatedStepTool[] = [],
+    allowedToolNames?: string[],
+  ): ResolvedToolSet {
+    // Start from operation-level snapshot (shallow copies, with safe defaults)
+    const tools: UniformTool[] = [...(operationToolSet.tools ?? [])];
+    const sourceMap: Record<string, ToolSource> = { ...operationToolSet.sourceMap };
+    const executorMap: Record<string, ToolExecutor> = { ...operationToolSet.executorMap };
+    const enabledToolIds: string[] = [...(operationToolSet.enabledToolIds ?? [])];
+
+    // Only include manifests for enabled tools to prevent injecting
+    // systemRole for disabled tools (e.g. web-browsing when search is off)
+    const manifestMap: Record<string, LobeToolManifest> = {};
+    for (const id of enabledToolIds) {
+      if (operationToolSet.manifestMap[id]) {
+        manifestMap[id] = operationToolSet.manifestMap[id];
+      }
+    }
+
+    const deferredManifestMap = operationToolSet.deferredManifestMap ?? {};
+
+    // Apply accumulated step-level activations from previous steps
+    for (const activation of accumulatedActivations) {
+      this.applyActivation(
+        activation,
+        tools,
+        manifestMap,
+        sourceMap,
+        enabledToolIds,
+        deferredManifestMap,
+      );
+    }
+
+    // Apply current step delta activations
+    for (const activation of stepDelta.activatedTools) {
+      this.applyActivation(
+        activation,
+        tools,
+        manifestMap,
+        sourceMap,
+        enabledToolIds,
+        deferredManifestMap,
+      );
+    }
+
+    const shouldFilterByToolNames = allowedToolNames !== undefined;
+    const allowedToolNameSet = new Set(allowedToolNames ?? []);
+    const toolNameResolver = new ToolNameResolver();
+
+    let promptManifestMap = manifestMap;
+    if (shouldFilterByToolNames) {
+      promptManifestMap = {};
+
+      for (const [identifier, manifest] of Object.entries(manifestMap)) {
+        const api = manifest.api.filter(({ name }) =>
+          allowedToolNameSet.has(toolNameResolver.generate(identifier, name, manifest.type)),
+        );
+
+        if (api.length > 0) {
+          promptManifestMap[identifier] = {
+            ...manifest,
+            api,
+            ...(api.length < manifest.api.length && { systemRole: undefined }),
+          };
+        }
+      }
+    }
+
+    // Handle deactivation (e.g. forceFinish strips all tools)
+    if (stepDelta.deactivatedToolIds?.includes('*')) {
+      return {
+        enabledToolIds: [],
+        executorMap,
+        manifestMap, // keep manifests for ToolNameResolver
+        promptManifestMap: {},
+        sourceMap,
+        tools: [],
+      };
+    }
+
+    // Deduplicate tools by function name
+    const seen = new Set<string>();
+    const dedupedTools: UniformTool[] = [];
+    for (const tool of tools) {
+      if (shouldFilterByToolNames && !allowedToolNameSet.has(tool.function.name)) {
+        continue;
+      }
+      if (!seen.has(tool.function.name)) {
+        seen.add(tool.function.name);
+        dedupedTools.push(tool);
+      }
+    }
+
+    const resolvedEnabledToolIds = shouldFilterByToolNames
+      ? enabledToolIds.filter((id) => !!promptManifestMap[id])
+      : enabledToolIds;
+
+    return {
+      enabledToolIds: [...new Set(resolvedEnabledToolIds)],
+      executorMap,
+      manifestMap,
+      promptManifestMap,
+      sourceMap,
+      tools: dedupedTools,
+    };
+  }
+
+  private applyActivation(
+    activation: { id: string; manifest?: LobeToolManifest; source?: string },
+    tools: UniformTool[],
+    manifestMap: Record<string, LobeToolManifest>,
+    sourceMap: Record<string, ToolSource>,
+    enabledToolIds: string[],
+    deferredManifestMap: Record<string, LobeToolManifest>,
+  ): void {
+    // A tool the operation deferred is promoted to its full manifest, even when
+    // a narrowed one is already enabled. The schemas both manifests share are
+    // deduplicated by function name afterwards.
+    const deferredManifest = deferredManifestMap[activation.id];
+    const presentManifest = manifestMap[activation.id];
+    if (presentManifest && (!deferredManifest || presentManifest === deferredManifest)) return;
+
+    const manifest = deferredManifest ?? activation.manifest;
+    if (manifest) {
+      manifestMap[activation.id] = manifest;
+      const newTools = generateToolsFromManifest(manifest);
+      tools.push(...newTools);
+      enabledToolIds.push(activation.id);
+
+      // Only set source if not already present — the operation-level sourceMap
+      // may already have the correct routing source (e.g., 'lobehubSkill', 'composio')
+      // and the activation source ('discovery') should not overwrite it.
+      if (activation.source && !sourceMap[activation.id]) {
+        sourceMap[activation.id] = this.mapSource(activation.source);
+      }
+    }
+  }
+
+  private mapSource(source: string): ToolSource {
+    switch (source) {
+      case 'device': {
+        return 'builtin';
+      }
+      case 'discovery':
+      case 'active_tools':
+      case 'mention': {
+        return 'builtin';
+      }
+      default: {
+        return 'builtin';
+      }
+    }
+  }
+}

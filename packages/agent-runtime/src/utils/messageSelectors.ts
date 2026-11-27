@@ -1,0 +1,437 @@
+import type { StepActivatedSkill, StepContextTodos, UIChatMessage } from '@lobechat/types';
+
+import { isNonEmptyString, isPlainRecord } from './object';
+
+/**
+ * Wire-format tool identifiers that carry skill activations in their
+ * pluginState. Literal copies of `SkillsIdentifier`
+ * (@lobechat/builtin-tool-skills) and `LobeActivatorIdentifier`
+ * (@lobechat/builtin-tool-activator) — both are frozen, persisted in DB
+ * message rows, and not importable here without adding tool-package deps to
+ * the runtime core.
+ */
+const SKILLS_IDENTIFIER = 'lobe-skills';
+const ACTIVATOR_IDENTIFIER = 'lobe-activator';
+
+/**
+ * Literal copies of `LobeAgentIdentifier` and its todo-mutating API names
+ * (@lobechat/builtin-tool-lobe-agent), frozen for the same reason as above.
+ */
+const LOBE_AGENT_IDENTIFIER = 'lobe-agent';
+const TODO_MUTATION_APIS = new Set(['clearTodos', 'createTodos', 'updateTodos']);
+
+export const isTodoMutationCall = (identifier?: string, apiName?: string) =>
+  identifier === LOBE_AGENT_IDENTIFIER && !!apiName && TODO_MUTATION_APIS.has(apiName);
+
+/**
+ * Options for message visitor traversal
+ */
+export interface MessageVisitorOptions {
+  /**
+   * Filter by message role (e.g. 'tool', 'user', 'assistant')
+   */
+  role?: UIChatMessage['role'];
+}
+
+/**
+ * Find the first matching result by visiting messages in reverse order (newest first).
+ *
+ * A generic message traversal utility following the AST visitor pattern.
+ * The visitor function is called for each message that passes the filter.
+ * Returns immediately when the visitor returns a non-undefined value.
+ *
+ * @example
+ * ```typescript
+ * // Extract device context from most recent tool message
+ * const device = findInMessages(messages, (msg) => {
+ *   const id = msg.pluginState?.metadata?.activeDeviceId;
+ *   if (id) return { activeDeviceId: id };
+ * }, { role: 'tool' });
+ *
+ * // Find latest lobe-agent todos
+ * const todos = findInMessages(messages, (msg) => {
+ *   if (msg.plugin?.identifier === LobeAgentIdentifier) return msg.pluginState?.todos;
+ * }, { role: 'tool' });
+ * ```
+ */
+export const findInMessages = <T>(
+  messages: UIChatMessage[],
+  visitor: (msg: UIChatMessage) => T | undefined,
+  options?: MessageVisitorOptions,
+): T | undefined => {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (options?.role && msg.role !== options.role) continue;
+
+    const result = visitor(msg);
+    if (result !== undefined) return result;
+  }
+
+  return undefined;
+};
+
+/**
+ * Collect all matching results by visiting messages in forward order.
+ *
+ * Unlike `findInMessages` which returns the first match, this function
+ * collects all non-undefined visitor results. Useful for cumulative
+ * state like activated tool IDs.
+ *
+ * @example
+ * ```typescript
+ * // Accumulate activated tool identifiers
+ * const tools = collectFromMessages(messages, (msg) => {
+ *   if (msg.plugin?.identifier === LobeActivatorIdentifier) {
+ *     return msg.pluginState?.activatedTools;
+ *   }
+ * }, { role: 'tool' });
+ * ```
+ */
+export const collectFromMessages = <T>(
+  messages: UIChatMessage[],
+  visitor: (msg: UIChatMessage) => T | undefined,
+  options?: MessageVisitorOptions,
+): T[] => {
+  const results: T[] = [];
+
+  for (const msg of messages) {
+    if (options?.role && msg.role !== options.role) continue;
+
+    const result = visitor(msg);
+    if (result !== undefined) results.push(result);
+  }
+
+  return results;
+};
+
+/**
+ * A single tool invocation observed in the conversation, normalized across the
+ * two message shapes activations can arrive in (see
+ * `collectToolInvocations`).
+ */
+interface ToolInvocation {
+  apiName?: string;
+  identifier?: string;
+  state?: any;
+  toolCallId?: string;
+}
+
+/**
+ * Normalize one message into the tool invocations it carries.
+ *
+ * Two shapes must be handled:
+ * 1. Flat DB rows — `role='tool'` messages with `plugin` / `pluginState`
+ *    (client store, `execAgent` initialMessages, same-run pushed results).
+ * 2. Virtual grouped nodes produced by conversation-flow `parse()` — the
+ *    server runtime rehydrates `state.messages` from the DB at every step
+ *    (`rehydrateStateMessagesFromDB`), which folds completed turns into
+ *    `assistantGroup` / `supervisor` nodes: tool rows disappear as standalone
+ *    entries and live on `children[].tools[]` instead, with the original
+ *    `pluginState` re-attached as `result.state` (see
+ *    FlatListBuilder.createAssistantGroupMessage). Without this branch,
+ *    cross-turn skill activations are invisible to later runs.
+ *    `compressedGroup` nodes keep their members on `compressedMessages` in
+ *    the same flat-list shape, so recurse into them.
+ */
+const collectToolInvocations = (msg: UIChatMessage): ToolInvocation[] => {
+  if (msg.role === 'tool') {
+    return [
+      {
+        apiName: msg.plugin?.apiName,
+        identifier: msg.plugin?.identifier,
+        state: msg.pluginState,
+        toolCallId: msg.tool_call_id,
+      },
+    ];
+  }
+
+  const invocations: ToolInvocation[] = [];
+
+  const { children } = msg;
+  if (Array.isArray(children)) {
+    for (const child of children) {
+      if (!Array.isArray(child?.tools)) continue;
+      for (const tool of child.tools) {
+        invocations.push({
+          apiName: tool?.apiName,
+          identifier: tool?.identifier,
+          state: tool?.result?.state,
+          toolCallId: tool?.id,
+        });
+      }
+    }
+  }
+
+  const { compressedMessages } = msg;
+  if (Array.isArray(compressedMessages)) {
+    for (const compressed of compressedMessages) {
+      invocations.push(...collectToolInvocations(compressed));
+    }
+  }
+
+  return invocations;
+};
+
+const isTodoItem = (value: unknown): value is StepContextTodos['items'][number] =>
+  isPlainRecord(value) &&
+  typeof value.text === 'string' &&
+  (value.status === 'todo' || value.status === 'processing' || value.status === 'completed');
+
+/** Normalize persisted canonical and legacy TODO states without guessing alternate fields. */
+export const normalizeTodosState = (
+  value: unknown,
+  fallbackUpdatedAt: string,
+): StepContextTodos | undefined => {
+  const items = Array.isArray(value)
+    ? value
+    : isPlainRecord(value) && Array.isArray(value.items)
+      ? value.items
+      : undefined;
+
+  if (!items || !items.every(isTodoItem)) return undefined;
+
+  const updatedAt =
+    isPlainRecord(value) && isNonEmptyString(value.updatedAt) ? value.updatedAt : fallbackUpdatedAt;
+
+  return { items, updatedAt };
+};
+
+/** Select the newest valid exact `pluginState.todos` state across flat and grouped messages. */
+export const extractTodosFromMessages = (
+  messages: UIChatMessage[],
+): StepContextTodos | undefined => {
+  const fallbackUpdatedAt = new Date().toISOString();
+
+  for (let messageIndex = messages.length - 1; messageIndex >= 0; messageIndex--) {
+    const invocations = collectToolInvocations(messages[messageIndex]);
+    for (let invocationIndex = invocations.length - 1; invocationIndex >= 0; invocationIndex--) {
+      const state = invocations[invocationIndex].state;
+      if (!isPlainRecord(state) || !Object.hasOwn(state, 'todos')) continue;
+
+      const todos = normalizeTodosState(state.todos, fallbackUpdatedAt);
+      if (todos !== undefined) return todos;
+    }
+  }
+
+  return undefined;
+};
+
+/**
+ * Count the todo-mutating calls at the end of the conversation with no other
+ * tool call in between, stopping at the latest user message. Text-only
+ * assistant output does not reset the count: a model stuck re-managing its list
+ * keeps announcing that it will stop while it keeps calling (production: ~490
+ * todo calls in one 33-minute run).
+ */
+export const countTrailingTodoCalls = (
+  messages: UIChatMessage[],
+  /**
+   * Calls of the batch being executed. Its assistant is already persisted with
+   * these calls (and, on an approval resume, their placeholder rows), so they
+   * would otherwise count as history.
+   */
+  pendingToolCallIds: ReadonlySet<string>,
+): number => {
+  let count = 0;
+
+  for (let messageIndex = messages.length - 1; messageIndex >= 0; messageIndex--) {
+    const message = messages[messageIndex];
+    if (message.role === 'user') return count;
+
+    const invocations = collectToolInvocations(message);
+    for (let invocationIndex = invocations.length - 1; invocationIndex >= 0; invocationIndex--) {
+      const { apiName, identifier, toolCallId } = invocations[invocationIndex];
+      if (toolCallId && pendingToolCallIds.has(toolCallId)) continue;
+      if (!isTodoMutationCall(identifier, apiName)) return count;
+      count++;
+    }
+  }
+
+  return count;
+};
+
+/**
+ * Accumulate activated skills from all activateSkill / activateTools tool
+ * messages. Skills once activated remain active for the rest of the
+ * conversation; the skill id (or name, for filesystem/builtin activations that
+ * persist no id) deduplicates — a reactivation updates the entry AND moves it
+ * to the end, since exec paths treat the last entry as the most recent
+ * activation when picking the script cwd.
+ *
+ * Shared by the client transport (chat store dbMessage selector feeding
+ * `computeStepContext`) and the server runtime executors (`callTool` /
+ * `callToolsBatch`), so both execution paths resolve the same activation set
+ * for skills `execScript`. Handles both flat `role='tool'` rows and the
+ * conversation-flow grouped shape (`assistantGroup` etc.) — see
+ * `collectToolInvocations`.
+ */
+export const extractActivatedSkillsFromMessages = (
+  messages: UIChatMessage[],
+): StepActivatedSkill[] | undefined => {
+  const skillsMap = new Map<string, StepActivatedSkill>();
+
+  for (const msg of messages) {
+    for (const invocation of collectToolInvocations(msg)) {
+      if (!(
+        invocation.identifier === SKILLS_IDENTIFIER ||
+        invocation.identifier === ACTIVATOR_IDENTIFIER
+      ))
+        continue;
+
+      // Direct activateSkill calls — state has top-level name (id only for DB
+      // skills; filesystem/builtin activations persist no id, so `name` alone
+      // must be enough to keep them — server exec paths match by name anyway).
+      if (invocation.apiName === 'activateSkill' && invocation.state?.name) {
+        const id = invocation.state.id as string | undefined;
+        const name = invocation.state.name as string;
+        const key = id ?? name;
+        // Delete before set so reactivation moves the skill to the end —
+        // downstream exec paths pick the LAST resolvable skill as cwd, so
+        // insertion order must reflect activation recency (A → B → A must
+        // yield [B, A], not Map#set's kept-in-place [A, B]).
+        skillsMap.delete(key);
+        skillsMap.set(key, {
+          description: invocation.state.description as string | undefined,
+          ...(id && { id }),
+          name,
+        });
+      }
+
+      // activateTools fallback — skills nested in pluginState.activatedSkills[]
+      if (
+        invocation.apiName === 'activateTools' &&
+        Array.isArray(invocation.state?.activatedSkills)
+      ) {
+        for (const skill of invocation.state.activatedSkills as Array<{
+          description?: string;
+          id?: string;
+          name?: string;
+        }>) {
+          if (skill.name) {
+            const key = skill.id ?? skill.name;
+            // Same delete-before-set as above: keep activation recency.
+            skillsMap.delete(key);
+            skillsMap.set(key, {
+              description: skill.description,
+              ...(skill.id && { id: skill.id }),
+              name: skill.name,
+            });
+          }
+        }
+      }
+    }
+  }
+
+  return skillsMap.size > 0 ? [...skillsMap.values()] : undefined;
+};
+
+/**
+ * Accumulate tool identifiers activated by lobe-activator across conversation
+ * turns. A new operation uses these identifiers to restore its step-level tool
+ * state, keeping discovered tools callable after the operation boundary.
+ */
+export const extractToolActivationsFromMessages = (
+  messages: UIChatMessage[],
+): { id: string; afterToolCallId?: string }[] | undefined => {
+  const activations = new Map<string, { id: string; afterToolCallId?: string }>();
+
+  for (const msg of messages) {
+    for (const invocation of collectToolInvocations(msg)) {
+      if (
+        invocation.identifier !== ACTIVATOR_IDENTIFIER ||
+        invocation.apiName !== 'activateTools' ||
+        !Array.isArray(invocation.state?.activatedTools)
+      )
+        continue;
+
+      for (const tool of invocation.state.activatedTools as Array<{ identifier?: string }>) {
+        if (tool.identifier && !activations.has(tool.identifier)) {
+          activations.set(tool.identifier, {
+            id: tool.identifier,
+            ...(invocation.toolCallId && { afterToolCallId: invocation.toolCallId }),
+          });
+        }
+      }
+    }
+  }
+
+  return activations.size > 0 ? [...activations.values()] : undefined;
+};
+
+export const extractActivatedToolIdsFromMessages = (
+  messages: UIChatMessage[],
+): string[] | undefined => extractToolActivationsFromMessages(messages)?.map(({ id }) => id);
+
+const TOOL_NAME_SEPARATOR = '____';
+
+const messageHasToolInvocation = (
+  msg: UIChatMessage,
+  identifier: string,
+  prefix: string,
+  apiNames?: ReadonlySet<string>,
+): boolean => {
+  // A call whose API name was not recorded counts: it cannot be ruled out.
+  const matchesApi = (apiName: string | undefined) =>
+    !apiNames || !apiName || apiNames.has(apiName);
+
+  if (
+    collectToolInvocations(msg).some(
+      (invocation) => invocation.identifier === identifier && matchesApi(invocation.apiName),
+    )
+  ) {
+    return true;
+  }
+
+  if (msg.role === 'assistant') {
+    if (
+      Array.isArray(msg.tools) &&
+      msg.tools.some((tool) => tool?.identifier === identifier && matchesApi(tool?.apiName))
+    ) {
+      return true;
+    }
+
+    const toolCalls = (msg as { tool_calls?: Array<{ function?: { name?: string } }> }).tool_calls;
+    if (
+      Array.isArray(toolCalls) &&
+      toolCalls.some((call) => {
+        const name = call?.function?.name;
+        if (name === identifier) return true;
+        return (
+          typeof name === 'string' &&
+          name.startsWith(prefix) &&
+          matchesApi(name.slice(prefix.length))
+        );
+      })
+    ) {
+      return true;
+    }
+  }
+
+  if (Array.isArray(msg.compressedMessages)) {
+    return msg.compressedMessages.some((compressed) =>
+      messageHasToolInvocation(compressed, identifier, prefix, apiNames),
+    );
+  }
+
+  return false;
+};
+
+/**
+ * Whether the conversation history contains a tool invocation for `identifier`,
+ * optionally limited to the given API names.
+ *
+ * Covers flat DB rows (`role='tool'` and `role='assistant'` with `tools` /
+ * `tool_calls`), grouped `assistantGroup` / `supervisor` nodes, and nested
+ * `compressedGroup` entries. Used to keep the APIs of a deferred tool (such as
+ * the skill APIs of `lobe-skills`) declared when earlier turns already called
+ * them: a provider rejects a history that calls a function the request no
+ * longer declares.
+ */
+export const hasHistoricalToolInvocation = (
+  messages: UIChatMessage[],
+  identifier: string,
+  apiNames?: ReadonlySet<string>,
+): boolean => {
+  const prefix = `${identifier}${TOOL_NAME_SEPARATOR}`;
+  return messages.some((msg) => messageHasToolInvocation(msg, identifier, prefix, apiNames));
+};

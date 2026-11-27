@@ -1,0 +1,282 @@
+import { spawn } from 'node:child_process';
+
+import { resolveAgentCredentialSpawnEnv } from '@lobechat/device-control/agent-credentials';
+import {
+  listDefaultClaudeLogin,
+  resolveClaudeAccountSpawnEnv,
+} from '@lobechat/device-control/claude-code-account-routing';
+import {
+  buildClaudeCodeEntrypointEnv,
+  buildHeteroExecStdinPayload,
+  HETERO_EXEC_INHERIT_PROCESS_GROUP_ENV,
+  type HeteroExecImageRef,
+  stripInheritedRunIdentity,
+} from '@lobechat/heterogeneous-agents/protocol';
+import type { ClaudeCodeAccountRouting } from '@lobechat/heterogeneous-agents/quota';
+import { resolveHeteroSpawnCwd } from '@lobechat/heterogeneous-agents/workingDirectory';
+import type { CodexCollaborationMode, HeteroPermissionMode } from '@lobechat/types';
+
+import { getTask, removeTask, saveTask } from '../daemon/taskRegistry';
+import { agentCredentialRootDir } from './agentCredentials';
+import { registerAgentRun } from './agentRunRegistry';
+
+export interface SpawnHeteroAgentRunParams {
+  agentId?: string;
+  agentType: string;
+  /** Resolved `lh hetero exec` wrapper args. */
+  args?: string[];
+  assistantMessageId?: string;
+  /** Claude Code account the server routed this run to. */
+  claudeAccountRouting?: ClaudeCodeAccountRouting;
+  /** Entrypoint name the agent asked Claude Code to report. */
+  claudeCodeEntrypoint?: string;
+  /** Codex Plan switch, forwarded in the input envelope. */
+  collaborationMode?: CodexCollaborationMode;
+  cwd?: string;
+  /** Image attachments (signed URLs) appended as image content blocks. */
+  imageList?: HeteroExecImageRef[];
+  jwt: string;
+  operationId: string;
+  /** Claude Code permission mode, forwarded in the input envelope. */
+  permissionMode?: HeteroPermissionMode;
+  prompt: string;
+  /** System context used only by the automatic retry without native resume. */
+  resumeFallbackSystemContext?: string;
+  resumeSessionId?: string;
+  serverUrl: string;
+  systemContext?: string;
+  topicId: string;
+  /** Topic/run workspace — forwarded as `LOBEHUB_WORKSPACE_ID` for ingest. */
+  workspaceId?: string;
+}
+
+export interface AgentRunAckResult {
+  reason?: string;
+  status: 'accepted' | 'rejected';
+}
+
+interface SpawnHeteroAgentRunLogger {
+  error?: (msg: string) => void;
+  info?: (msg: string) => void;
+}
+
+/**
+ * Spawn `lh hetero exec` for a gateway-dispatched agent run. Mirrors the
+ * desktop app's `spawnLhHeteroExec`: the spawned CLI owns the full pipeline
+ * (spawn -> adapt -> BatchIngester -> server ingest), so the connect daemon
+ * needs no local stream handling — it only kicks off the process.
+ *
+ * Re-invokes the current CLI entry (`process.execPath` + `process.argv[1]`)
+ * instead of relying on `lh` being on `PATH`, so it also works inside the
+ * detached `lh connect --daemon` child where `PATH` may be minimal.
+ *
+ * Resolves only once the child's outcome is known: `accepted` on the `spawn`
+ * event, `rejected` on an early wrapper-process `error`. A missing target cwd
+ * is handled inside `lh hetero exec`, which can classify it and emit
+ * `heteroFinish`; other wrapper spawn failures flow back as rejected dispatches.
+ */
+export function spawnHeteroAgentRun(
+  params: SpawnHeteroAgentRunParams,
+  logger?: SpawnHeteroAgentRunLogger,
+): Promise<AgentRunAckResult> {
+  // Only agents that accept an installed credential pay for the lookup.
+  if (params.agentType !== 'claude-code' && params.agentType !== 'codex') {
+    return spawnWithAccountRouting(params, logger);
+  }
+
+  // Precedence: a credential the server installed on this device wins over
+  // both the device's own login and Claude Code account routing; an expired or
+  // unreadable one fails the run rather than falling back to another login.
+  return resolveAgentCredentialSpawnEnv(params.agentType, {
+    rootDir: agentCredentialRootDir(),
+  }).then((credential) => {
+    if (credential.kind === 'none') return spawnWithAccountRouting(params, logger);
+    if (credential.kind === 'reject') {
+      logger?.error?.(`hetero exec rejected (op=${params.operationId}): ${credential.reason}`);
+      return { reason: credential.reason, status: 'rejected' as const };
+    }
+    logger?.info?.(
+      `hetero exec uses the installed ${params.agentType} credential (op=${params.operationId})`,
+    );
+    return startHeteroAgentRun(params, credential.env, logger, credential.unsetEnv);
+  });
+}
+
+function spawnWithAccountRouting(
+  params: SpawnHeteroAgentRunParams,
+  logger?: SpawnHeteroAgentRunLogger,
+): Promise<AgentRunAckResult> {
+  if (!params.claudeAccountRouting) return startHeteroAgentRun(params, {}, logger);
+
+  // A plain CLI device holds one Claude Code login (the one `claude` uses
+  // here), so routing either confirms it or rejects a run pinned elsewhere.
+  const inheritedEnv = stripInheritedRunIdentity(process.env);
+  return resolveClaudeAccountSpawnEnv(params.claudeAccountRouting, {
+    inheritedEnv,
+    listLogins: () => listDefaultClaudeLogin(inheritedEnv),
+  }).then((account) => {
+    if (account.kind === 'spawn') return startHeteroAgentRun(params, account.env, logger);
+    logger?.error?.(`hetero exec rejected (op=${params.operationId}): ${account.reason}`);
+    return { reason: account.reason, status: 'rejected' as const };
+  });
+}
+
+function startHeteroAgentRun(
+  params: SpawnHeteroAgentRunParams,
+  accountEnv: Record<string, string>,
+  logger?: SpawnHeteroAgentRunLogger,
+  /** Inherited env keys that would outrank `accountEnv`'s credential. */
+  unsetEnv: readonly string[] = [],
+): Promise<AgentRunAckResult> {
+  const {
+    agentType,
+    assistantMessageId,
+    args: extraArgs,
+    cwd,
+    imageList,
+    jwt,
+    operationId,
+    prompt,
+    resumeFallbackSystemContext,
+    resumeSessionId,
+    serverUrl,
+    systemContext,
+    topicId,
+    workspaceId,
+  } = params;
+  const workDir = cwd ?? process.cwd();
+  // A stale project path must not prevent the wrapper CLI from starting: the
+  // inner spawnAgent preflight owns cwd classification and reports the
+  // structured working_directory_not_found error through heteroFinish.
+  const spawnCwd = resolveHeteroSpawnCwd(workDir);
+
+  // Server-ingest mode (--topic + --operation-id): events are batch-POSTed to
+  // the server, not rendered. `--input-json -` reads the prompt from stdin.
+  const cliArgs = [
+    process.argv[1],
+    'hetero',
+    'exec',
+    '--type',
+    agentType,
+    '--operation-id',
+    operationId,
+    '--topic',
+    topicId,
+    '--render',
+    'none',
+    '--input-json',
+    '-',
+    '--cwd',
+    workDir,
+    ...(resumeSessionId ? ['--resume', resumeSessionId] : []),
+    ...(extraArgs ?? []),
+  ];
+
+  // systemContext / image attachments turn the payload into a content-block
+  // array: context block first, then the user's prompt, then images — mirrors
+  // the desktop path. `lh hetero exec` coerces both shapes via
+  // coerceJsonPrompt.
+  const stdinPayload = buildHeteroExecStdinPayload({
+    collaborationMode: params.collaborationMode,
+    imageList,
+    isNewSession: !resumeSessionId,
+    permissionMode: params.permissionMode,
+    prompt,
+    resumeFallbackSystemContext,
+    systemContext,
+  });
+
+  // A connector can itself be started inside another agent run. Its ambient
+  // identity (and JWT file) belongs to that ancestor, not this dispatched run.
+  const childEnv = stripInheritedRunIdentity(process.env);
+  for (const key of unsetEnv) delete childEnv[key];
+
+  return new Promise<AgentRunAckResult>((resolve) => {
+    let settled = false;
+    const settle = (result: AgentRunAckResult) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
+
+    let pid: number | undefined;
+    const child = spawn(process.execPath, [...process.execArgv, ...cliArgs], {
+      cwd: spawnCwd,
+      detached: true,
+      env: {
+        ...childEnv,
+        ...(params.agentId ? { LOBEHUB_AGENT_ID: params.agentId } : {}),
+        ...(assistantMessageId ? { LOBEHUB_ASSISTANT_MESSAGE_ID: assistantMessageId } : {}),
+        [HETERO_EXEC_INHERIT_PROCESS_GROUP_ENV]: '1',
+        LOBEHUB_JWT: jwt,
+        LOBEHUB_OPERATION_ID: operationId,
+        LOBEHUB_SERVER: serverUrl,
+        LOBEHUB_TOPIC_ID: topicId,
+        ...(workspaceId ? { LOBEHUB_WORKSPACE_ID: workspaceId } : {}),
+        ...accountEnv,
+        ...(agentType === 'claude-code'
+          ? buildClaudeCodeEntrypointEnv(params.claudeCodeEntrypoint)
+          : {}),
+      },
+      stdio: ['pipe', 'inherit', 'inherit'],
+      windowsHide: true,
+    });
+
+    child.once('spawn', () => {
+      registerAgentRun(operationId, child);
+      // Register the child into the task registry so `cancelHeteroTask`
+      // dispatched from the server can resolve it by operationId and signal
+      // the whole process group. `detached: true` places the CLI in its own
+      // group; the inherited-group env contract keeps its agent descendants
+      // in that same group without affecting the connect daemon.
+      pid = child.pid;
+      if (pid !== undefined) {
+        saveTask({
+          agentType,
+          operationId,
+          pid,
+          startedAt: new Date().toISOString(),
+          taskId: operationId,
+          topicId,
+          workspaceId,
+        });
+      }
+
+      // Only safe to write stdin once the process actually started.
+      try {
+        child.stdin?.write(stdinPayload);
+        child.stdin?.end();
+      } catch (err) {
+        logger?.error?.(
+          `hetero exec stdin write failed (op=${operationId}): ${(err as Error).message}`,
+        );
+      }
+      settle({ status: 'accepted' });
+    });
+
+    child.once('error', (err) => {
+      logger?.error?.(`hetero exec spawn failed (op=${operationId}): ${err.message}`);
+      settle({ reason: err.message, status: 'rejected' });
+    });
+
+    child.on('exit', (code, signal) => {
+      // Only remove the registry entry if the exiting PID still owns this
+      // task — a newer run that reused the same operationId must not be
+      // cleared by a stale exit event.
+      if (pid !== undefined && getTask(operationId)?.pid === pid) {
+        // The wrapper can exit before a background tool. Keep its process-group
+        // identity until cancellation can confirm all descendants have exited.
+        let groupExited = process.platform === 'win32';
+        if (!groupExited) {
+          try {
+            process.kill(-pid, 0);
+          } catch (error) {
+            groupExited = (error as NodeJS.ErrnoException).code === 'ESRCH';
+          }
+        }
+        if (groupExited) removeTask(operationId);
+      }
+      logger?.info?.(`hetero exec exited (op=${operationId}) code=${code} signal=${signal}`);
+    });
+  });
+}

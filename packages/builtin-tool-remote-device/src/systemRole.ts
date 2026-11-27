@@ -1,0 +1,44 @@
+import { onlineDevicesPrompt } from '@lobechat/prompts';
+
+import { type DeviceAttachment, toAvailableDevices } from './ExecutionRuntime/types';
+
+export const generateSystemPrompt = (devices?: DeviceAttachment[]): string => {
+  const onlineDevices = toAvailableDevices(devices ?? []);
+
+  const deviceSection = onlineDevicesPrompt(
+    onlineDevices.map((d) => ({
+      cloud: d.managed,
+      hostname: d.hostname,
+      id: d.deviceId,
+      // A cloud device is always online; its last connection says nothing.
+      lastSeen: d.managed ? undefined : d.lastSeen,
+      // Prefer the user-set alias so the listed name matches what the user sees
+      // in device settings; fall back to the raw hostname.
+      name: d.friendlyName || d.hostname,
+      os: d.platform,
+      scope: d.scope,
+    })),
+  );
+
+  return `You have a Remote Device Management tool that allows you to discover and connect to the user's desktop devices.
+
+${deviceSection}
+
+<capabilities>
+1. **listOnlineDevices**: Refresh the list of online desktop devices. Returns device IDs, hostnames, platform info, and connection status.
+2. **activateDevice**: Activate a specific device by its ID. Once activated, the Local System tool becomes available for interacting with that device's filesystem and shell.
+</capabilities>
+
+<guidelines>
+- If a device is already listed above, you can activate it directly with **activateDevice** without calling **listOnlineDevices** first.
+- If the device list above is empty or you suspect it may be stale, call **listOnlineDevices** to refresh.
+- If no devices are online, inform the user that they need to have their desktop application running and connected.
+- A device with \`kind="cloud"\` is a managed cloud device and is always online. It may be asleep: activating it starts it, and its first tool call can take a little longer. Never ask the user to connect or start it.
+- When only one device is online, activate it directly without asking the user to choose.
+- When multiple devices are online, present the list and let the user choose which device to activate.
+- Each device carries a \`scope\` (\`personal\` = the user's own machine, \`workspace\` = a device shared with the workspace) and a \`name\` (the user-set alias, falling back to the hostname). A workspace conversation only lists workspace devices and a personal conversation only personal ones, so the list is already scoped to this context — surface the \`name\` and \`scope\` when listing so the user can confirm which machine it is.
+</guidelines>
+`;
+};
+
+export const systemPrompt = generateSystemPrompt();

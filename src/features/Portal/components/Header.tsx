@@ -1,0 +1,100 @@
+'use client';
+
+import { AGENT_CHAT_TOPIC_PAGE_URL, AGENT_CHAT_TOPIC_URL } from '@lobechat/const';
+import { ActionIcon, Flexbox } from '@lobehub/ui';
+import { ArrowLeft, X } from 'lucide-react';
+import { type CSSProperties, Fragment, memo, type ReactNode } from 'react';
+import { useTranslation } from 'react-i18next';
+import { useLocation, useParams } from 'react-router';
+
+import NavHeader from '@/features/NavHeader';
+import { useWorkspaceAwareNavigate } from '@/features/Workspace/useWorkspaceAwareNavigate';
+import { useChatStore } from '@/store/chat';
+import { chatPortalSelectors } from '@/store/chat/selectors';
+import { useHeaderActionSize } from '@/styles/density';
+
+import { PortalMoreMenuSlot } from './PortalMoreMenu/context';
+
+const Header = memo<{
+  onClose?: () => void;
+  paddingInline?: number;
+  rightExtra?: ReactNode;
+  /** Overrides the default block/inline padding, e.g. for a full-height tab strip. */
+  style?: CSSProperties;
+  title: ReactNode;
+}>(({ onClose, paddingInline = 8, rightExtra, style, title }) => {
+  const headerActionSize = useHeaderActionSize(true);
+  const { t } = useTranslation('common');
+  const location = useLocation();
+  const navigate = useWorkspaceAwareNavigate();
+  const params = useParams<{ aid?: string; topicId?: string }>();
+  const [canGoBack, goBack, clearPortalStack] = useChatStore((s) => [
+    chatPortalSelectors.canGoBack(s),
+    s.goBack,
+    s.clearPortalStack,
+  ]);
+  const isTopicPageRoute =
+    !!params.aid &&
+    !!params.topicId &&
+    location.pathname.startsWith(AGENT_CHAT_TOPIC_PAGE_URL(params.aid, params.topicId));
+
+  return (
+    <NavHeader
+      showTogglePanelButton={false}
+      style={{ paddingInline, width: '100%', ...style }}
+      left={
+        <Flexbox horizontal align="center" flex={1} gap={4} style={{ minWidth: 0 }}>
+          {canGoBack && (
+            <ActionIcon
+              aria-label={t('back')}
+              icon={ArrowLeft}
+              size={headerActionSize}
+              title={t('back')}
+              onClick={goBack}
+            />
+          )}
+          {title}
+          {/* The `…` belongs to the thing the title names, not to the panel
+              chrome on the far edge, so it rides right behind the title. */}
+          <PortalMoreMenuSlot />
+        </Flexbox>
+      }
+      right={
+        <Fragment>
+          {rightExtra}
+          <ActionIcon
+            aria-label={t('close')}
+            icon={X}
+            size={headerActionSize}
+            title={t('close')}
+            onClick={() => {
+              if (onClose) {
+                onClose();
+                return;
+              }
+
+              if (params.aid && params.topicId && isTopicPageRoute) {
+                navigate(AGENT_CHAT_TOPIC_URL(params.aid, params.topicId));
+                return;
+              }
+
+              clearPortalStack();
+            }}
+          />
+        </Fragment>
+      }
+      styles={{
+        left: {
+          flex: 1,
+          marginLeft: canGoBack || paddingInline !== 8 ? 0 : 6,
+          minWidth: 0,
+        },
+        right: {
+          flex: 'none',
+        },
+      }}
+    />
+  );
+});
+
+export default Header;

@@ -1,0 +1,42 @@
+import { ActionIcon, type ActionIconProps } from '@lobehub/ui';
+import { ChevronLeftIcon } from 'lucide-react';
+import { memo, type MouseEvent } from 'react';
+
+import { useActiveWorkspaceSlug } from '@/business/client/hooks/useActiveWorkspaceSlug';
+import { appNavigate } from '@/features/Electron/navigation/appNavigate';
+import { buildWorkspaceAwarePath } from '@/features/Workspace/workspaceAwarePath';
+import { useHeaderActionSize } from '@/styles/density';
+
+export const BACK_BUTTON_ID = 'lobe-back-button';
+
+interface BackButtonProps extends ActionIconProps {
+  /** Go to the literal `to` without applying the active workspace prefix. */
+  escape?: boolean;
+  to?: string;
+}
+
+const BackButton = memo<BackButtonProps>(({ to = '/', escape, onClick, ...rest }) => {
+  const headerActionSize = useHeaderActionSize(true);
+  const activeSlug = useActiveWorkspaceSlug();
+  const resolvedTo = buildWorkspaceAwarePath(to, activeSlug, { escape });
+
+  const handleClick = (event: MouseEvent<HTMLAnchorElement>) => {
+    onClick?.(event as never);
+    if (event.defaultPrevented) return;
+    // Let the browser handle modifier/middle clicks (open-in-new) — matches the
+    // previous <Link> behavior; a plain click stays in-app via the facade.
+    if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || event.button !== 0) {
+      return;
+    }
+    event.preventDefault();
+    appNavigate(resolvedTo, { escape: true });
+  };
+
+  return (
+    <a href={resolvedTo} onClick={handleClick}>
+      <ActionIcon icon={ChevronLeftIcon} id={BACK_BUTTON_ID} size={headerActionSize} {...rest} />
+    </a>
+  );
+});
+
+export default BackButton;

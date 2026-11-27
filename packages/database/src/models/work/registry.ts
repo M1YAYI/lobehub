@@ -1,0 +1,84 @@
+import type { WorkType } from '@lobechat/types';
+
+import { artboardWorkAdapter } from './artboard';
+import { canvasWorkAdapter } from './canvas';
+import { collectionWorkAdapter } from './collection';
+import { documentWorkAdapter } from './document';
+import { externalWorkAdapter } from './external';
+import { fileWorkAdapter } from './file';
+import { goalReportWorkAdapter } from './goalReport';
+import type { WorkTypeAdapter } from './internal';
+import { taskWorkAdapter } from './task';
+
+/**
+ * The single registry for Work-type query and display strategies. Adding a
+ * Work type = adding one entry here (the `Record<WorkType, …>` constraint
+ * turns a missing entry into a compile error, not a silently missing result
+ * set) plus its type unions in `@lobechat/types`.
+ */
+export const WORK_TYPE_ADAPTERS = {
+  artboard: artboardWorkAdapter,
+  canvas: canvasWorkAdapter,
+  document: documentWorkAdapter,
+  external: externalWorkAdapter,
+  file: fileWorkAdapter,
+  collection: collectionWorkAdapter,
+  goal_report: goalReportWorkAdapter,
+  task: taskWorkAdapter,
+} satisfies Record<WorkType, WorkTypeAdapter>;
+
+/** Work types read only through their owner (the goal graph), never through Work lists. */
+const UNLISTED_WORK_TYPES = new Set<WorkType>(['goal_report']);
+
+export const WORK_TYPES = (Object.keys(WORK_TYPE_ADAPTERS) as WorkType[]).filter(
+  (type) => !UNLISTED_WORK_TYPES.has(type),
+);
+
+/** Type-erased adapter list for uniform iteration in the aggregate queries. */
+export const workTypeAdapters = WORK_TYPES.map(
+  (type) => WORK_TYPE_ADAPTERS[type],
+) as WorkTypeAdapter[];
+
+/**
+ * Work types gated behind an explicit client opt-in on the read path. `file` was
+ * added after most clients shipped (Electron updates lag weeks): their bundled
+ * descriptor table has no `file` entry, so a `file` work in the payload makes the
+ * works UI look it up, get `undefined`, and throw on `descriptor.getIcon`. A
+ * request that does not opt in therefore receives the pre-`file` set, keeping
+ * every already-deployed client byte-identically safe; new clients opt in.
+ */
+const OPT_IN_WORK_TYPES = new Set<WorkType>(['canvas', 'file', 'collection']);
+
+/**
+ * `artboard` shipped after clients already sent `includeFileWorks`, so it needs
+ * its own declaration: a client that opted into `file` still has no artboard
+ * descriptor and would throw on it the same way.
+ */
+const ARTBOARD_OPT_IN_WORK_TYPES = new Set<WorkType>(['artboard']);
+
+export interface WorkTypeOptIn {
+  includeArtboardWorks?: boolean;
+  includeFileWorks?: boolean;
+}
+
+/** The pre-`file` type set every already-deployed client is known to render. */
+export const LEGACY_WORK_TYPES = WORK_TYPES.filter(
+  (type) => !OPT_IN_WORK_TYPES.has(type) && !ARTBOARD_OPT_IN_WORK_TYPES.has(type),
+);
+
+/**
+ * Resolve the Work types a read request may return. Absent opt-in → the legacy
+ * set (the read-path chokepoint that preserves old clients); each opt-in adds
+ * only the types it declares. Used both for SQL row-level gating and to derive
+ * the adapter fan-out below.
+ */
+export const resolveAllowedWorkTypes = (optIn: WorkTypeOptIn = {}): WorkType[] =>
+  WORK_TYPES.filter(
+    (type) =>
+      (!OPT_IN_WORK_TYPES.has(type) || optIn.includeFileWorks) &&
+      (!ARTBOARD_OPT_IN_WORK_TYPES.has(type) || optIn.includeArtboardWorks),
+  );
+
+/** Adapter fan-out list narrowed to the types the request is allowed to return. */
+export const resolveWorkTypeAdapters = (optIn: WorkTypeOptIn = {}): WorkTypeAdapter[] =>
+  resolveAllowedWorkTypes(optIn).map((type) => WORK_TYPE_ADAPTERS[type]);

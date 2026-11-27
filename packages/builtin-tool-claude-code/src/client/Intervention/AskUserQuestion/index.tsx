@@ -1,0 +1,147 @@
+'use client';
+
+import {
+  type AskUserDraft,
+  type AskUserQuestionArgs,
+  AskUserQuestionView,
+  DEFAULT_COUNTDOWN_MS,
+  DRAFT_PLUGIN_STATE_KEY,
+  useAskUserForm,
+} from '@lobechat/shared-tool-ui/ask-user';
+import type { BuiltinInterventionProps } from '@lobechat/types';
+import { Flexbox, Icon, Text } from '@lobehub/ui';
+import { CircleAlert } from 'lucide-react';
+import { type ComponentProps, memo, useCallback } from 'react';
+import { useTranslation } from 'react-i18next';
+
+import { useConversationStore } from '@/features/Conversation/store';
+import { dataSelectors } from '@/features/Conversation/store/slices/data/selectors';
+import { useChatStore } from '@/store/chat';
+
+import PermissionRequestIntervention from '../PermissionRequest';
+import { useSubmissionReconcile } from '../useSubmissionReconcile';
+
+/**
+ * CC AskUserQuestion intervention component.
+ *
+ * A thin host wrapper around the shared `useAskUserForm` + `AskUserQuestionView`
+ * (in `@lobechat/shared-tool-ui/ask-user`). This wrapper owns the two
+ * app-coupled bits the shared module intentionally does not:
+ *   - draft persistence — read from / written to the tool message's
+ *     `pluginState.askUserDraft` via the conversation + chat stores, so HMR,
+ *     remounts, and tab switches resume where the user left off, and
+ *   - i18n — the `labels` built from CC's `claudeCode.askUserQuestion.*` keys.
+ *
+ * Everything else (pick/custom/escape/auto-advance/submit, the countdown, the
+ * timeout fallback, and the `__freeform__` bridge) lives in the shared hook.
+ */
+const AskUserQuestionIntervention = memo<BuiltinInterventionProps<AskUserQuestionArgs>>((props) => {
+  const { t } = useTranslation('tool');
+  const { actionsPortalTarget, args, disabled, messageId, onInteractionAction } = props;
+
+  // Persisted draft — read from the tool message's pluginState so the form
+  // stays where the user left it across unmount / HMR / refresh.
+  const persistedDraft = useConversationStore((s) => {
+    const msg = dataSelectors.getDbMessageById(messageId)(s);
+    return (msg?.pluginState as { [DRAFT_PLUGIN_STATE_KEY]?: unknown })?.[DRAFT_PLUGIN_STATE_KEY];
+  });
+  // The producer stamps its own ask-user deadline onto the durable tool row.
+  // Hand it to the form so the countdown tracks the clock that actually
+  // decides when the answer stops being deliverable, instead of restarting on
+  // every remount and outliving the blocked producer.
+  const deadlineAt = useConversationStore((s) => {
+    const msg = dataSelectors.getDbMessageById(messageId)(s);
+    const stored = (
+      msg?.pluginState as { heterogeneousIntervention?: { deadline?: unknown } } | undefined
+    )?.heterogeneousIntervention?.deadline;
+    return typeof stored === 'number' ? stored : undefined;
+  });
+  // Also asked in the Channel the run answers: the person may answer there, so the clock only
+  // closes the question instead of answering option 1 for them.
+  const askedInChannel = useConversationStore((s) => {
+    const msg = dataSelectors.getDbMessageById(messageId)(s);
+    return !!(msg?.pluginState as { channelAsk?: unknown } | undefined)?.channelAsk;
+  });
+  const submissionPhase = useChatStore((s) => s.questionSubmissions[messageId]);
+  // Stream events normally settle the card; a missed ACK is re-read.
+  useSubmissionReconcile(messageId);
+  const setInterventionDraft = useChatStore((s) => s.setInterventionDraft);
+  const writeDraft = useCallback(
+    (draft: AskUserDraft) => setInterventionDraft(messageId, draft),
+    [messageId, setInterventionDraft],
+  );
+
+  const form = useAskUserForm({
+    args,
+    countdownMs: DEFAULT_COUNTDOWN_MS,
+    deadlineAt,
+    disabled,
+    noAnswerOnTimeout: askedInChannel,
+    onInteractionAction,
+    persistedDraft,
+    writeDraft,
+  });
+
+  const labels = {
+    addNote: t('claudeCode.askUserQuestion.note.add'),
+    customPlaceholder: t('claudeCode.askUserQuestion.customOption.placeholder'),
+    next: (title: string) => t('claudeCode.askUserQuestion.next', { title }),
+    noteLabel: t('claudeCode.askUserQuestion.note.label'),
+    progress: (answered: number, total: number) =>
+      t('claudeCode.askUserQuestion.progress', { answered, total }),
+    recommendedTag: t('claudeCode.askUserQuestion.recommendedTag'),
+    skip: t('claudeCode.askUserQuestion.skip'),
+    submit: t('claudeCode.askUserQuestion.submit'),
+    removeNote: t('claudeCode.askUserQuestion.note.remove'),
+    sendNoteOnly: t('claudeCode.askUserQuestion.note.sendOnly'),
+    supplementPlaceholder: t('claudeCode.askUserQuestion.supplement.placeholder'),
+    timeExpired: t('claudeCode.askUserQuestion.timeExpired'),
+    timeExpiredNoAnswer: t('claudeCode.askUserQuestion.timeExpiredNoAnswer'),
+    timeRemaining: (time: string) =>
+      t(
+        form.autoSubmitOnTimeout
+          ? 'claudeCode.askUserQuestion.timeRemaining'
+          : 'claudeCode.askUserQuestion.timeRemainingNoAnswer',
+        { time },
+      ),
+  };
+
+  return (
+    <Flexbox gap={8}>
+      {(form.submissionFailed ||
+        submissionPhase === 'failed' ||
+        submissionPhase === 'uncertain') && (
+        <Text fontSize={12} role="alert" type="danger">
+          <Icon icon={CircleAlert} size={14} /> {t('askUserQuestion.submitFailed')}
+        </Text>
+      )}
+      <AskUserQuestionView
+        {...form}
+        showCountdown
+        actionsPortalTarget={actionsPortalTarget}
+        labels={labels}
+      />
+    </Flexbox>
+  );
+});
+
+AskUserQuestionIntervention.displayName = 'CCAskUserQuestionIntervention';
+
+/**
+ * A Claude Code permission request carries a
+ * `claudeCodePermission` detail beside the AskUserQuestion-shaped question:
+ * it gets its own card, which never counts down — Claude Code waits.
+ */
+const AskUserQuestionOrPermission = memo<BuiltinInterventionProps<AskUserQuestionArgs>>((props) =>
+  (props.args as { claudeCodePermission?: unknown } | undefined)?.claudeCodePermission ? (
+    <PermissionRequestIntervention
+      {...(props as unknown as ComponentProps<typeof PermissionRequestIntervention>)}
+    />
+  ) : (
+    <AskUserQuestionIntervention {...props} />
+  ),
+);
+
+AskUserQuestionOrPermission.displayName = 'CCAskUserQuestionOrPermission';
+
+export default AskUserQuestionOrPermission;

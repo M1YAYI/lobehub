@@ -1,0 +1,116 @@
+import { INBOX_SESSION_ID } from '@lobechat/const';
+import { agentDisplayName } from '@lobechat/types';
+import { preventDefault } from '@lobehub/ui';
+import { Command } from 'cmdk';
+import { memo, useMemo } from 'react';
+import { useTranslation } from 'react-i18next';
+
+import AgentAvatar from '@/components/AgentAvatar';
+import Avatar from '@/components/Avatar';
+import { useAgentStore } from '@/store/agent';
+import { agentSelectors, builtinAgentSelectors } from '@/store/agent/selectors';
+import { useHomeStore } from '@/store/home';
+import { homeAgentListSelectors } from '@/store/home/selectors';
+
+import { useCommandMenuContext } from './CommandMenuContext';
+import { styles } from './styles';
+
+const AskAgentCommands = memo(() => {
+  const { t } = useTranslation('common');
+  const { search, setSearch, setSelectedAgent } = useCommandMenuContext();
+
+  const inboxAgentId = useAgentStore(builtinAgentSelectors.inboxAgentId);
+  const inboxTitle = useAgentStore(agentSelectors.inboxAgentDisplayName);
+  const inboxAvatar = useAgentStore(agentSelectors.inboxAgentAvatar);
+  const allAgents = useHomeStore(homeAgentListSelectors.allAgents);
+
+  // Check if search starts with "@"
+  const isAtMention = search.trimStart().startsWith('@');
+
+  // Get the query after "@" for filtering
+  const mentionQuery = useMemo(() => {
+    if (!isAtMention) return '';
+    return search.trimStart().slice(1).toLowerCase();
+  }, [search, isAtMention]);
+
+  // Filter agents based on the query after "@"
+  const filteredAgents = useMemo(() => {
+    // Lobe AI has its own fixed `@` row, so its list item is left out.
+    const agents = allAgents.filter(
+      (item) => item.type === 'agent' && item.slug !== INBOX_SESSION_ID,
+    );
+    if (!mentionQuery) {
+      return agents.slice(0, 10);
+    }
+    return agents
+      .filter((agent) => {
+        const title = (agentDisplayName(agent) ?? '').toLowerCase();
+        return title.includes(mentionQuery);
+      })
+      .slice(0, 10);
+  }, [allAgents, mentionQuery]);
+
+  const handleAgentSelect = (agentId: string, agentTitle: string, agentAvatar: string) => {
+    setSelectedAgent({
+      avatar: agentAvatar,
+      id: agentId,
+      title: agentTitle,
+    });
+    setSearch('');
+  };
+
+  // Only show when user types "@"
+  if (!isAtMention) return null;
+
+  // Check if the default assistant matches the query
+  const showLobeAI = !mentionQuery || inboxTitle.toLowerCase().includes(mentionQuery.toLowerCase());
+
+  return (
+    <Command.Group heading={t('cmdk.mentionAgent')}>
+      {/* @<default assistant> option */}
+      {showLobeAI && (
+        <Command.Item
+          value="@lobe-ai"
+          onMouseDown={preventDefault}
+          onSelect={() => handleAgentSelect(inboxAgentId, inboxTitle, inboxAvatar)}
+        >
+          <Avatar emojiScaleWithBackground avatar={inboxAvatar} shape="square" size={18} />
+          <div className={styles.itemContent}>
+            <div className={styles.itemLabel}>@{inboxTitle}</div>
+          </div>
+        </Command.Item>
+      )}
+
+      {/* @agent options */}
+      {filteredAgents.map((agent) => (
+        <Command.Item
+          key={agent.id}
+          value={`@${agentDisplayName(agent, 'agent')}-${agent.id}`}
+          onMouseDown={preventDefault}
+          onSelect={() =>
+            handleAgentSelect(
+              agent.id,
+              agentDisplayName(agent, t('defaultAgent')),
+              typeof agent.avatar === 'string' ? agent.avatar : '',
+            )
+          }
+        >
+          <AgentAvatar
+            agentId={agent.id}
+            avatar={typeof agent.avatar === 'string' ? agent.avatar : undefined}
+            name={agentDisplayName(agent, t('defaultAgent'))}
+            shape="square"
+            size={18}
+          />
+          <div className={styles.itemContent}>
+            <div className={styles.itemLabel}>@{agentDisplayName(agent, t('defaultAgent'))}</div>
+          </div>
+        </Command.Item>
+      ))}
+    </Command.Group>
+  );
+});
+
+AskAgentCommands.displayName = 'AskAgentCommands';
+
+export default AskAgentCommands;

@@ -1,0 +1,182 @@
+import { ENABLE_TOOL_CHANNEL_SETTINGS } from '@lobechat/business-const';
+import {
+  AppWindowIcon,
+  Brain,
+  BrainCircuit,
+  ChartColumnBigIcon,
+  ChartPieIcon,
+  CodeXmlIcon,
+  CreditCard,
+  Database,
+  EllipsisIcon,
+  Gift,
+  Info,
+  KeyIcon,
+  KeyRound,
+  Map,
+  PaletteIcon,
+  Sparkles,
+  TagIcon,
+  UserCircle,
+  Wrench,
+} from 'lucide-react';
+import { useMemo } from 'react';
+import { useTranslation } from 'react-i18next';
+
+import { useCodingPlansTab } from '@/business/client/hooks/useCodingPlansTab';
+import { type CellProps } from '@/components/Cell';
+import { useWorkspaceAwareNavigate } from '@/features/Workspace/useWorkspaceAwareNavigate';
+import { SettingsTabs } from '@/store/global/initialState';
+import {
+  featureFlagsSelectors,
+  serverConfigSelectors,
+  useServerConfigStore,
+} from '@/store/serverConfig';
+import { useUserStore } from '@/store/user';
+import { labPreferSelectors } from '@/store/user/selectors';
+
+export enum SettingsGroupKey {
+  Agent = 'agent',
+  Connection = 'connection',
+  General = 'general',
+  Resource = 'resource',
+  Subscription = 'subscription',
+  System = 'system',
+}
+
+export interface CategoryItem extends Omit<CellProps, 'type'> {
+  key: SettingsTabs;
+}
+
+export interface CategoryGroup {
+  items: CategoryItem[];
+  key: SettingsGroupKey;
+  title: string;
+}
+
+export const useCategory = (): CategoryGroup[] => {
+  const navigate = useWorkspaceAwareNavigate();
+  const { t } = useTranslation(['setting', 'auth', 'subscription']);
+  const { hideDocs, showApiKeyManage, showProvider } = useServerConfigStore(featureFlagsSelectors);
+  const enableBusinessFeatures = useServerConfigStore(serverConfigSelectors.enableBusinessFeatures);
+  const codingPlansTab = useCodingPlansTab();
+  // Advanced only holds gateway mode on mobile; without it the page is empty.
+  const enableGatewayMode = useServerConfigStore(serverConfigSelectors.enableGatewayMode);
+  const enableOAuthApps = useUserStore(labPreferSelectors.enableOAuthApps);
+
+  return useMemo(() => {
+    const navigateTo = (key: SettingsTabs) =>
+      navigate(key === SettingsTabs.Provider ? '/settings/provider/all' : `/settings/${key}`);
+
+    const makeItem = (item: Omit<CategoryItem, 'onClick'>): CategoryItem => ({
+      ...item,
+      onClick: () => navigateTo(item.key),
+    });
+
+    const general: CategoryItem[] = [
+      makeItem({ icon: UserCircle, key: SettingsTabs.Profile, label: t('auth:profile.title') }),
+      makeItem({ icon: ChartColumnBigIcon, key: SettingsTabs.Stats, label: t('auth:tab.stats') }),
+      makeItem({
+        icon: PaletteIcon,
+        key: SettingsTabs.Appearance,
+        label: t('setting:tab.appearance'),
+      }),
+    ];
+
+    const subscription: CategoryItem[] = enableBusinessFeatures
+      ? [
+          makeItem({ icon: Map, key: SettingsTabs.Plans, label: t('subscription:tab.plans') }),
+          makeItem({
+            icon: ChartPieIcon,
+            key: SettingsTabs.Usage,
+            label: t('subscription:tab.usage'),
+          }),
+          makeItem({
+            icon: CreditCard,
+            key: SettingsTabs.Billing,
+            label: t('subscription:tab.billing'),
+          }),
+          makeItem({
+            icon: Gift,
+            key: SettingsTabs.Referral,
+            label: t('subscription:tab.referral'),
+          }),
+        ].filter((item): item is CategoryItem => Boolean(item))
+      : [];
+
+    const agent: CategoryItem[] = [
+      // Provider settings should not depend on Advanced tools: new users may need
+      // non-LobeHub providers, and desktop users often bring their own API keys.
+      showProvider &&
+        makeItem({ icon: Brain, key: SettingsTabs.Provider, label: t('setting:tab.provider') }),
+      makeItem({
+        icon: Sparkles,
+        key: SettingsTabs.ServiceModel,
+        label: t('setting:tab.serviceModel'),
+      }),
+      makeItem({ icon: TagIcon, key: SettingsTabs.Labels, label: t('setting:tab.labels') }),
+      makeItem({ icon: BrainCircuit, key: SettingsTabs.Memory, label: t('setting:tab.memory') }),
+      ENABLE_TOOL_CHANNEL_SETTINGS &&
+        makeItem({ icon: Wrench, key: SettingsTabs.Tools, label: t('setting:tab.tools') }),
+    ].filter((item): item is CategoryItem => Boolean(item));
+
+    // Runtime, as on desktop: the optional business tab, listed only where its
+    // slot supplies a label (the other Runtime pages have no mobile version).
+    const resource: CategoryItem[] =
+      enableBusinessFeatures && codingPlansTab
+        ? [
+            makeItem({
+              icon: CodeXmlIcon,
+              key: SettingsTabs.CodingPlans,
+              label: codingPlansTab.label,
+            }),
+          ]
+        : [];
+
+    const connection: CategoryItem[] = [
+      makeItem({ icon: KeyRound, key: SettingsTabs.Creds, label: t('setting:tab.creds') }),
+    ];
+
+    const system: CategoryItem[] = [
+      makeItem({ icon: Database, key: SettingsTabs.Storage, label: t('setting:tab.storage') }),
+      enableGatewayMode &&
+        makeItem({
+          icon: EllipsisIcon,
+          key: SettingsTabs.Advanced,
+          label: t('setting:tab.advanced'),
+        }),
+      showApiKeyManage &&
+        makeItem({ icon: KeyIcon, key: SettingsTabs.APIKey, label: t('auth:tab.apikey') }),
+      enableOAuthApps &&
+        makeItem({
+          icon: AppWindowIcon,
+          key: SettingsTabs.OAuthApps,
+          label: t('auth:tab.oauthApps'),
+        }),
+      !hideDocs && makeItem({ icon: Info, key: SettingsTabs.About, label: t('setting:tab.about') }),
+    ].filter((item): item is CategoryItem => Boolean(item));
+
+    return [
+      { items: general, key: SettingsGroupKey.General, title: t('setting:group.common') },
+      {
+        items: subscription,
+        key: SettingsGroupKey.Subscription,
+        title: t('setting:group.subscription'),
+      },
+      { items: agent, key: SettingsGroupKey.Agent, title: t('setting:group.aiConfig') },
+      { items: resource, key: SettingsGroupKey.Resource, title: t('setting:group.resource') },
+      { items: connection, key: SettingsGroupKey.Connection, title: t('setting:group.connection') },
+      { items: system, key: SettingsGroupKey.System, title: t('setting:group.systemDeveloper') },
+    ].filter((group) => group.items.length > 0);
+  }, [
+    t,
+    enableBusinessFeatures,
+    codingPlansTab,
+    hideDocs,
+    showApiKeyManage,
+    showProvider,
+    enableOAuthApps,
+    enableGatewayMode,
+    navigate,
+  ]);
+};

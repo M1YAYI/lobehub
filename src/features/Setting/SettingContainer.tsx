@@ -1,0 +1,51 @@
+'use client';
+
+import { type FlexboxProps } from '@lobehub/ui';
+import { cssVar, Flexbox, useTheme } from '@lobehub/ui';
+import { type PropsWithChildren, type ReactNode } from 'react';
+import { memo } from 'react';
+
+import { useInterfaceDensity } from '@/styles/density';
+
+interface SettingContainerProps extends FlexboxProps {
+  addonAfter?: ReactNode;
+  addonBefore?: ReactNode;
+  maxWidth?: number | string;
+  variant?: 'default' | 'secondary';
+}
+const SettingContainer = memo<PropsWithChildren<SettingContainerProps>>(
+  ({ variant, maxWidth = 1024, children, addonAfter, addonBefore, style, ...rest }) => {
+    const theme = useTheme(); // Keep for colorBgContainerSecondary (not in cssVar)
+    const compact = useInterfaceDensity() === 'compact';
+    return (
+      <Flexbox
+        align={'center'}
+        height={'100%'}
+        width={'100%'}
+        style={{
+          background:
+            variant === 'secondary' ? theme.colorBgContainerSecondary : cssVar.colorBgContainer,
+          overflowX: 'hidden',
+          overflowY: 'auto',
+          ...style,
+        }}
+        {...rest}
+      >
+        {addonBefore}
+        <Flexbox
+          flex={1}
+          gap={compact ? 24 : 36}
+          width={'100%'}
+          style={{
+            maxWidth,
+          }}
+        >
+          {children}
+        </Flexbox>
+        {addonAfter}
+      </Flexbox>
+    );
+  },
+);
+
+export default SettingContainer;

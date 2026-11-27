@@ -1,0 +1,228 @@
+import type { LobeTool } from '@lobechat/types';
+import { and, desc, eq, inArray, sql } from 'drizzle-orm';
+
+import type { InstalledPluginItem, NewInstalledPlugin } from '../schemas';
+import { userConnectors, userInstalledPlugins } from '../schemas';
+import type { LobeChatDatabase } from '../type';
+import { buildWorkspaceWhere } from '../utils/workspace';
+
+export class PluginModel {
+  private userId: string;
+  private db: LobeChatDatabase;
+  private workspaceId?: string;
+
+  constructor(db: LobeChatDatabase, userId: string, workspaceId?: string) {
+    this.userId = userId;
+    this.db = db;
+    this.workspaceId = workspaceId;
+  }
+
+  private ownership = () =>
+    buildWorkspaceWhere(
+      { userId: this.userId, workspaceId: this.workspaceId },
+      userInstalledPlugins,
+    );
+
+  // Legacy evaluation installations are quarantined by server-owned provenance.
+  private visible = () =>
+    and(this.ownership(), sql`COALESCE(${userInstalledPlugins.source}, '') <> 'agent-eval'`);
+
+  create = async (
+    params: Pick<
+      NewInstalledPlugin,
+      'type' | 'identifier' | 'manifest' | 'customParams' | 'settings' | 'source'
+    >,
+  ) => {
+    return this.db.transaction(async (tx) => {
+      // Legacy eval installs share this table's (userId, identifier) primary key.
+      // Move only their storage key aside; keep the manifest, address and auth intact.
+      // Model-facing identifiers live in the frozen contract, independently of this key.
+      if (params.source !== 'agent-eval') {
+        await tx
+          .update(userInstalledPlugins)
+          .set({ identifier: `agent-eval:${crypto.randomUUID()}` })
+          .where(
+            and(
+              eq(userInstalledPlugins.userId, this.userId),
+              eq(userInstalledPlugins.identifier, params.identifier),
+              eq(userInstalledPlugins.source, 'agent-eval'),
+            ),
+          );
+      }
+      const [result] = await tx
+        .insert(userInstalledPlugins)
+        .values({ ...params, userId: this.userId, workspaceId: this.workspaceId ?? null })
+        .onConflictDoUpdate({
+          set: { ...params, updatedAt: new Date() },
+          target: [userInstalledPlugins.identifier, userInstalledPlugins.userId],
+        })
+        .returning();
+      return result;
+    });
+  };
+
+  delete = async (id: string) => {
+    return this.db
+      .delete(userInstalledPlugins)
+      .where(and(eq(userInstalledPlugins.identifier, id), this.visible()));
+  };
+
+  /**
+   * Delete only the caller's own installation. Workspace reads span every
+   * member's row with the same identifier, so migration cleanup must not use
+   * the workspace-wide {@link delete}: members can hold different settings and
+   * credentials for the same legacy plugin.
+   */
+  deleteOwned = async (id: string) => {
+    return this.db
+      .delete(userInstalledPlugins)
+      .where(
+        and(
+          eq(userInstalledPlugins.identifier, id),
+          eq(userInstalledPlugins.userId, this.userId),
+          this.visible(),
+        ),
+      );
+  };
+
+  /**
+   * Remove an app's projection when its shared Composio connection goes. The
+   * shared connection's projection is the app's, so a teammate's legacy
+   * connection goes with it; a row mirroring a member's private connection of
+   * the same app stays, as that connection still runs on it.
+   */
+  deleteComposioProjectionKeepingPrivate = async (identifier: string) => {
+    return this.db.delete(userInstalledPlugins).where(
+      and(
+        eq(userInstalledPlugins.identifier, identifier),
+        this.visible(),
+        sql`NOT EXISTS (
+          SELECT 1 FROM ${userConnectors}
+          WHERE ${userConnectors.identifier} = ${identifier}
+            AND ${userConnectors.visibility} = 'private'
+            AND ${userConnectors.agentId} IS NULL
+            AND ${userConnectors.workspaceId} IS NOT DISTINCT FROM ${userInstalledPlugins.workspaceId}
+            AND ${userConnectors.metadata} -> 'composio' ->> 'connectedAccountId'
+              = ${userInstalledPlugins.customParams} -> 'composio' ->> 'connectedAccountId'
+        )`,
+      ),
+    );
+  };
+
+  /**
+   * Remove the projection rows that mirror one Composio account, leaving the
+   * app's other projection rows. In a workspace every member's projection row
+   * is in scope, and a private connection is one member's: deleting by
+   * identifier ({@link delete}) would also drop a teammate's legacy
+   * connection of the same app.
+   */
+  deleteComposioMirrors = async (identifier: string, connectedAccountId: string) => {
+    return this.db
+      .delete(userInstalledPlugins)
+      .where(
+        and(
+          eq(userInstalledPlugins.identifier, identifier),
+          this.visible(),
+          sql`${userInstalledPlugins.customParams} -> 'composio' ->> 'connectedAccountId' = ${connectedAccountId}`,
+        ),
+      );
+  };
+
+  deleteAll = async () => {
+    return this.db.delete(userInstalledPlugins).where(this.ownership());
+  };
+
+  /**
+   * The installed plugins in scope. `forClient` leaves out the Composio
+   * projection of a teammate's private connection: the projection is
+   * workspace-wide, but only its owner may run that connection, so a client
+   * listing it would offer tools whose every call is refused. A projection with
+   * no connection row (a legacy-only connection) stays.
+   */
+  query = async ({ forClient = false }: { forClient?: boolean } = {}) => {
+    const data = await this.db
+      .select({
+        createdAt: userInstalledPlugins.createdAt,
+        customParams: userInstalledPlugins.customParams,
+        identifier: userInstalledPlugins.identifier,
+        manifest: userInstalledPlugins.manifest,
+        settings: userInstalledPlugins.settings,
+        source: userInstalledPlugins.type,
+        type: userInstalledPlugins.type,
+        updatedAt: userInstalledPlugins.updatedAt,
+      })
+      .from(userInstalledPlugins)
+      .where(
+        and(
+          this.visible(),
+          forClient
+            ? sql`NOT EXISTS (
+                SELECT 1 FROM ${userConnectors}
+                WHERE ${userConnectors.identifier} = ${userInstalledPlugins.identifier}
+                  AND ${userConnectors.visibility} = 'private'
+                  AND ${userConnectors.userId} <> ${this.userId}
+                  AND ${userConnectors.workspaceId} IS NOT DISTINCT FROM ${userInstalledPlugins.workspaceId}
+                  AND ${userConnectors.metadata} -> 'composio' ->> 'connectedAccountId'
+                    = ${userInstalledPlugins.customParams} -> 'composio' ->> 'connectedAccountId'
+              )`
+            : undefined,
+        ),
+      )
+      .orderBy(desc(userInstalledPlugins.createdAt));
+
+    return data.map<LobeTool>((item) => ({
+      ...item,
+      runtimeType: item.manifest?.type || 'default',
+    }));
+  };
+
+  /**
+   * The Composio projection rows in scope, newest first, with the user who
+   * wrote each. A workspace keeps one projection row per member for the same
+   * app, so a lookup by identifier ({@link findById}) picks an arbitrary one.
+   */
+  queryComposioMirrors = async (identifiers?: string[]) => {
+    if (identifiers?.length === 0) return [];
+
+    return this.db
+      .select({
+        customParams: userInstalledPlugins.customParams,
+        identifier: userInstalledPlugins.identifier,
+        manifest: userInstalledPlugins.manifest,
+        userId: userInstalledPlugins.userId,
+      })
+      .from(userInstalledPlugins)
+      .where(
+        and(
+          this.visible(),
+          sql`COALESCE(jsonb_exists(${userInstalledPlugins.customParams}, 'composio'), false)`,
+          identifiers ? inArray(userInstalledPlugins.identifier, identifiers) : undefined,
+        ),
+      )
+      .orderBy(desc(userInstalledPlugins.createdAt), userInstalledPlugins.userId);
+  };
+
+  findById = async (id: string) => {
+    return this.db.query.userInstalledPlugins.findFirst({
+      where: and(eq(userInstalledPlugins.identifier, id), this.visible()),
+    });
+  };
+
+  /** The caller's own row for this identifier, never a teammate's same-named row. */
+  findOwnedById = async (id: string) => {
+    return this.db.query.userInstalledPlugins.findFirst({
+      where: and(
+        eq(userInstalledPlugins.identifier, id),
+        eq(userInstalledPlugins.userId, this.userId),
+        this.visible(),
+      ),
+    });
+  };
+
+  update = async (id: string, value: Partial<InstalledPluginItem>) => {
+    return this.db
+      .update(userInstalledPlugins)
+      .set({ ...value, updatedAt: new Date() })
+      .where(and(eq(userInstalledPlugins.identifier, id), this.visible()));
+  };
+}

@@ -1,0 +1,361 @@
+// @vitest-environment node
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+
+import { getTestDB } from '../../core/getTestDB';
+import type { NewInstalledPlugin } from '../../schemas';
+import { userConnectors, userInstalledPlugins, users, workspaces } from '../../schemas';
+import type { LobeChatDatabase } from '../../type';
+import { PluginModel } from '../plugin';
+
+const serverDB: LobeChatDatabase = await getTestDB();
+
+const userId = 'plugin-db';
+const pluginModel = new PluginModel(serverDB, userId);
+
+beforeEach(async () => {
+  await serverDB.transaction(async (trx) => {
+    await trx.delete(users);
+    await trx.insert(users).values([{ id: userId }, { id: '456' }]);
+  });
+});
+
+afterEach(async () => {
+  await serverDB.delete(users);
+});
+
+describe('PluginModel', () => {
+  it('excludes quarantined evaluation installations from normal discovery and execution lookup', async () => {
+    await pluginModel.create({
+      identifier: 'eval-only',
+      type: 'customPlugin',
+      source: 'agent-eval',
+    });
+    await pluginModel.create({ identifier: 'ordinary', type: 'customPlugin' });
+    expect((await pluginModel.query()).map((p) => p.identifier)).toEqual(['ordinary']);
+    expect(await pluginModel.findById('eval-only')).toBeUndefined();
+    expect(await pluginModel.findById('ordinary')).toBeDefined();
+  });
+
+  it('installing a real plugin coexists with a legacy eval installation in another workspace and preserves its connection', async () => {
+    await serverDB.insert(workspaces).values({
+      id: 'legacy-eval-workspace',
+      name: 'Eval',
+      slug: 'legacy-eval',
+      primaryOwnerId: userId,
+    });
+    const evaluationModel = new PluginModel(serverDB, userId, 'legacy-eval-workspace');
+    await evaluationModel.create({
+      identifier: 'notion',
+      type: 'customPlugin',
+      source: 'agent-eval',
+      customParams: { mcp: { type: 'http', url: 'https://mock.invalid/mcp' } },
+      settings: { token: 'old-private-token' },
+      manifest: { identifier: 'notion' } as any,
+    });
+    await pluginModel.create({
+      identifier: 'notion',
+      type: 'plugin',
+      manifest: { identifier: 'notion', meta: { title: 'Notion' } } as any,
+    });
+    const saved = await pluginModel.findById('notion');
+    expect(saved?.source).toBeNull();
+    expect(saved?.customParams).toBeNull();
+    expect(saved?.settings).toBeNull();
+    expect((await pluginModel.query()).map((p) => p.identifier)).toEqual(['notion']);
+    const stored = await serverDB.select().from(userInstalledPlugins);
+    expect(stored).toHaveLength(2);
+    const evaluation = stored.find((p) => p.source === 'agent-eval');
+    expect(evaluation?.identifier).toMatch(/^agent-eval:/);
+    expect(evaluation?.manifest?.identifier).toBe('notion');
+    expect(evaluation?.customParams?.mcp?.url).toBe('https://mock.invalid/mcp');
+    expect(evaluation?.settings).toEqual({ token: 'old-private-token' });
+  });
+
+  describe('create', () => {
+    it('should create a new installed plugin', async () => {
+      const params = {
+        type: 'plugin',
+        identifier: 'test-plugin',
+        manifest: { identifier: 'Test Plugin' },
+        customParams: { manifestUrl: 'abc123' },
+      } as NewInstalledPlugin;
+
+      const result = await pluginModel.create(params);
+
+      expect(result.userId).toBe(userId);
+      expect(result.type).toBe(params.type);
+      expect(result.identifier).toBe(params.identifier);
+      expect(result.manifest).toEqual(params.manifest);
+      expect(result.customParams).toEqual(params.customParams);
+    });
+  });
+
+  describe('delete', () => {
+    it('should delete an installed plugin by identifier', async () => {
+      await serverDB.insert(userInstalledPlugins).values({
+        userId,
+        type: 'plugin',
+        identifier: 'test-plugin',
+        manifest: { name: 'Test Plugin' },
+      } as unknown as NewInstalledPlugin);
+
+      await pluginModel.delete('test-plugin');
+
+      const result = await serverDB.select().from(userInstalledPlugins);
+      expect(result).toHaveLength(0);
+    });
+  });
+
+  describe('deleteAll', () => {
+    it('should delete all installed plugins for the user', async () => {
+      await serverDB.insert(userInstalledPlugins).values([
+        {
+          userId,
+          type: 'plugin',
+          identifier: 'test-plugin-1',
+          manifest: { name: 'Test Plugin 1' },
+        },
+        {
+          userId,
+          type: 'plugin',
+          identifier: 'test-plugin-2',
+          manifest: { name: 'Test Plugin 2' },
+        },
+        {
+          userId: '456',
+          type: 'plugin',
+          identifier: 'test-plugin-3',
+          manifest: { name: 'Test Plugin 3' },
+        },
+      ] as unknown as NewInstalledPlugin[]);
+
+      await pluginModel.deleteAll();
+
+      const result = await serverDB.select().from(userInstalledPlugins);
+      expect(result).toHaveLength(1);
+      expect(result[0].userId).toBe('456');
+    });
+  });
+
+  describe('query', () => {
+    it('should query installed plugins for the user', async () => {
+      await serverDB.insert(userInstalledPlugins).values([
+        {
+          userId,
+          type: 'plugin',
+          identifier: 'test-plugin-1',
+          manifest: { name: 'Test Plugin 1' },
+          createdAt: new Date('2023-01-01'),
+        },
+        {
+          userId,
+          type: 'plugin',
+          identifier: 'test-plugin-2',
+          manifest: { name: 'Test Plugin 2' },
+          createdAt: new Date('2023-02-01'),
+        },
+        {
+          userId: '456',
+          type: 'plugin',
+          identifier: 'test-plugin-3',
+          manifest: { name: 'Test Plugin 3' },
+          createdAt: new Date('2023-03-01'),
+        },
+      ] as unknown as NewInstalledPlugin[]);
+
+      const result = await pluginModel.query();
+
+      expect(result).toHaveLength(2);
+      expect(result[0].identifier).toBe('test-plugin-2');
+      expect(result[1].identifier).toBe('test-plugin-1');
+    });
+  });
+
+  describe('findById', () => {
+    it('should find an installed plugin by identifier', async () => {
+      await serverDB.insert(userInstalledPlugins).values([
+        {
+          userId,
+          type: 'plugin',
+          identifier: 'test-plugin-1',
+          manifest: { name: 'Test Plugin 1' },
+        },
+        {
+          userId: '456',
+          type: 'plugin',
+          identifier: 'test-plugin-2',
+          manifest: { name: 'Test Plugin 2' },
+        },
+      ] as unknown as NewInstalledPlugin[]);
+
+      const result = await pluginModel.findById('test-plugin-1');
+
+      expect(result?.userId).toBe(userId);
+      expect(result?.identifier).toBe('test-plugin-1');
+    });
+  });
+
+  describe('owner-scoped lookup and delete', () => {
+    const workspaceId = 'plugin-owner-ws';
+
+    beforeEach(async () => {
+      await serverDB
+        .insert(workspaces)
+        .values({ id: workspaceId, name: 'WS', primaryOwnerId: userId, slug: workspaceId });
+      await new PluginModel(serverDB, userId, workspaceId).create({
+        identifier: 'shared-legacy',
+        settings: { token: 'mine' },
+        type: 'customPlugin',
+      });
+      await new PluginModel(serverDB, '456', workspaceId).create({
+        identifier: 'shared-legacy',
+        settings: { token: 'teammate' },
+        type: 'customPlugin',
+      });
+    });
+
+    it('finds only the caller’s row when teammates installed the same identifier', async () => {
+      const result = await new PluginModel(serverDB, userId, workspaceId).findOwnedById(
+        'shared-legacy',
+      );
+
+      expect(result?.userId).toBe(userId);
+      expect(result?.settings).toEqual({ token: 'mine' });
+    });
+
+    it('deletes only the caller’s row when teammates installed the same identifier', async () => {
+      await new PluginModel(serverDB, userId, workspaceId).deleteOwned('shared-legacy');
+
+      const rows = await serverDB.select().from(userInstalledPlugins);
+      expect(rows).toHaveLength(1);
+      expect(rows[0].userId).toBe('456');
+      expect(rows[0].settings).toEqual({ token: 'teammate' });
+    });
+  });
+
+  describe('Composio projection in a workspace', () => {
+    const workspaceId = 'plugin-composio-ws';
+    const composio = (connectedAccountId: string) => ({
+      composio: { appSlug: 'GMAIL', authConfigId: 'cfg', connectedAccountId, status: 'ACTIVE' },
+    });
+
+    beforeEach(async () => {
+      await serverDB
+        .insert(workspaces)
+        .values({ id: workspaceId, name: 'WS', primaryOwnerId: userId, slug: workspaceId });
+      // One projection row per member for the same app, plus a non-Composio plugin.
+      await new PluginModel(serverDB, userId, workspaceId).create({
+        customParams: composio('acc-legacy'),
+        identifier: 'gmail',
+        type: 'plugin',
+      });
+      await new PluginModel(serverDB, '456', workspaceId).create({
+        customParams: composio('acc-private'),
+        identifier: 'gmail',
+        type: 'plugin',
+      });
+      await new PluginModel(serverDB, userId, workspaceId).create({
+        identifier: 'search',
+        type: 'plugin',
+      });
+    });
+
+    it('lists every member’s Composio rows with who wrote them', async () => {
+      const rows = await new PluginModel(serverDB, '456', workspaceId).queryComposioMirrors([
+        'gmail',
+        'search',
+      ]);
+
+      expect(
+        rows.map((row) => [row.userId, row.customParams?.composio?.connectedAccountId]).sort(),
+      ).toEqual([
+        ['456', 'acc-private'],
+        [userId, 'acc-legacy'],
+      ]);
+      expect(await new PluginModel(serverDB, '456', workspaceId).queryComposioMirrors([])).toEqual(
+        [],
+      );
+    });
+
+    it('removes only the rows mirroring one account', async () => {
+      await new PluginModel(serverDB, '456', workspaceId).deleteComposioMirrors(
+        'gmail',
+        'acc-private',
+      );
+
+      const rows = await new PluginModel(serverDB, userId, workspaceId).queryComposioMirrors();
+      expect(rows.map((row) => row.customParams?.composio?.connectedAccountId)).toEqual([
+        'acc-legacy',
+      ]);
+    });
+
+    it("leaves a teammate's private connection out of a client listing", async () => {
+      // 456's projection mirrors its private connection of the app; the
+      // caller's legacy-only connection has no connection row
+      await serverDB.insert(userConnectors).values({
+        identifier: 'gmail',
+        metadata: { composio: { connectedAccountId: 'acc-private' } },
+        name: 'Gmail',
+        sourceType: 'composio',
+        status: 'connected',
+        userId: '456',
+        visibility: 'private',
+        workspaceId,
+      } as any);
+      const accounts = (rows: { customParams?: any }[]) =>
+        rows.map((row) => row.customParams?.composio?.connectedAccountId).filter(Boolean);
+
+      const caller = new PluginModel(serverDB, userId, workspaceId);
+      expect(accounts(await caller.query({ forClient: true }))).toEqual(['acc-legacy']);
+      // Server runs keep reading every projection row
+      expect(accounts(await caller.query()).sort()).toEqual(['acc-legacy', 'acc-private']);
+      // The owner still lists their own
+      expect(
+        accounts(
+          await new PluginModel(serverDB, '456', workspaceId).query({ forClient: true }),
+        ).sort(),
+      ).toEqual(['acc-legacy', 'acc-private']);
+    });
+
+    it("removes a shared connection's projection but keeps a member's private connection", async () => {
+      // 456's projection mirrors its private connection of the app
+      await serverDB.insert(userConnectors).values({
+        identifier: 'gmail',
+        metadata: { composio: { connectedAccountId: 'acc-private' } },
+        name: 'Gmail',
+        sourceType: 'composio',
+        status: 'connected',
+        userId: '456',
+        visibility: 'private',
+        workspaceId,
+      } as any);
+
+      await new PluginModel(serverDB, userId, workspaceId).deleteComposioProjectionKeepingPrivate(
+        'gmail',
+      );
+
+      const rows = await new PluginModel(serverDB, userId, workspaceId).queryComposioMirrors();
+      expect(rows.map((row) => row.customParams?.composio?.connectedAccountId)).toEqual([
+        'acc-private',
+      ]);
+      expect(await new PluginModel(serverDB, userId, workspaceId).findById('search')).toBeDefined();
+    });
+  });
+
+  describe('update', () => {
+    it('should update an installed plugin', async () => {
+      await serverDB.insert(userInstalledPlugins).values({
+        userId,
+        type: 'plugin',
+        identifier: 'test-plugin',
+        manifest: {},
+        settings: { enabled: true },
+      } as unknown as NewInstalledPlugin);
+
+      await pluginModel.update('test-plugin', { settings: { enabled: false } });
+
+      const result = await pluginModel.findById('test-plugin');
+      expect(result?.settings).toEqual({ enabled: false });
+    });
+  });
+});

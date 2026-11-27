@@ -1,0 +1,52 @@
+'use client';
+
+import { type SearchBarProps } from '@lobehub/ui';
+import { SearchBar } from '@lobehub/ui';
+import { memo, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import urlJoin from 'url-join';
+
+import { withSuspense } from '@/components/withSuspense';
+import { getMarketplaceSubPath, MARKETPLACE_PATH } from '@/features/Marketplace/paths';
+import { useQueryRoute } from '@/hooks/useQueryRoute';
+import { usePathname, useQuery } from '@/libs/router/navigation';
+
+interface StoreSearchBarProps extends SearchBarProps {
+  mobile?: boolean;
+}
+
+const Search = memo<StoreSearchBarProps>(() => {
+  const { t } = useTranslation('discover');
+  const pathname = usePathname();
+  const { q } = useQuery() as { q?: string };
+  const router = useQueryRoute();
+  const [word, setWord] = useState<string>(q || '');
+  // Workspace-aware: `/:slug/marketplace/<tab>` reads `<tab>`, not `marketplace`.
+  const activeTab = getMarketplaceSubPath(pathname)?.split('/')[0] || 'agent';
+  const handleSearch = (value: string) => {
+    router.push(urlJoin(MARKETPLACE_PATH, activeTab), {
+      query: value ? { q: value } : {},
+      replace: true,
+    });
+  };
+
+  return (
+    <SearchBar
+      data-testid="search-bar"
+      defaultValue={q}
+      placeholder={t('search.placeholder')}
+      value={word}
+      variant={'borderless'}
+      style={{
+        width: '100%',
+      }}
+      onSearch={handleSearch}
+      onInputChange={(v) => {
+        setWord(v);
+        if (!v) handleSearch('');
+      }}
+    />
+  );
+});
+
+export default withSuspense(Search);

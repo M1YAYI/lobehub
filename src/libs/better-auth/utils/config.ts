@@ -1,0 +1,182 @@
+import { type BetterAuthOptions } from 'better-auth/minimal';
+
+import assetLinks from '@/../public/.well-known/assetlinks.json';
+import { appEnv } from '@/envs/app';
+import { authEnv } from '@/envs/auth';
+import { getRedisConfig } from '@/envs/redis';
+import { initializeRedis, isRedisEnabled } from '@/server/modules/Redis';
+import { isDev } from '@/utils/env';
+
+const APPLE_TRUSTED_ORIGIN = 'https://appleid.apple.com';
+const ANDROID_APP_NAMESPACE = 'android_app';
+const ANDROID_PASSKEY_RELATION = 'delegate_permission/common.get_login_creds';
+const MOBILE_APP_SCHEME = 'com.lobehub.app://';
+const EXPO_DEV_SCHEME = 'exp://*/*';
+
+/**
+ * Normalize a URL-like string to an origin with https fallback.
+ * Returns the original string if it's a custom scheme (e.g., com.lobehub.app://).
+ */
+export const normalizeOrigin = (url?: string) => {
+  if (!url) return undefined;
+
+  // Handle custom schemes (e.g., mobile app deep links)
+  if (url.includes('://') && !url.startsWith('http')) {
+    return url;
+  }
+
+  try {
+    const normalizedUrl = url.startsWith('http') ? url : `https://${url}`;
+
+    return new URL(normalizedUrl).origin;
+  } catch {
+    return undefined;
+  }
+};
+
+const parseTrustedOrigins = (value?: string) =>
+  value
+    ?.split(',')
+    .map((item) => normalizeOrigin(item.trim()))
+    .filter((origin): origin is string => Boolean(origin));
+
+const mergeOrigins = (...originGroups: Array<string[] | undefined>) => {
+  const mergedOrigins = new Set(originGroups.flatMap((origins) => origins ?? []));
+
+  return mergedOrigins.size > 0 ? Array.from(mergedOrigins) : undefined;
+};
+
+const fingerprintToAndroidOrigin = (fingerprint: string) => {
+  const hex = fingerprint.replaceAll(':', '');
+  if (!/^[\dA-F]{64}$/i.test(hex)) return undefined;
+
+  return `android:apk-key-hash:${Buffer.from(hex, 'hex').toString('base64url')}`;
+};
+
+const getAndroidPasskeyOrigins = () =>
+  assetLinks.flatMap(({ relation, target }) => {
+    if (
+      target.namespace !== ANDROID_APP_NAMESPACE ||
+      !relation.includes(ANDROID_PASSKEY_RELATION)
+    ) {
+      return [];
+    }
+
+    return target.sha256_cert_fingerprints
+      .map(fingerprintToAndroidOrigin)
+      .filter((origin): origin is string => Boolean(origin));
+  });
+
+/**
+ * Build the exact WebAuthn origins accepted by the passkey plugin.
+ *
+ * Android Credential Manager derives its origin from the APK signing certificate. The public
+ * Digital Asset Links file is already the source of truth for certificates authorized to use
+ * LobeHub credentials, so keep Better Auth's allowlist in sync with it instead of duplicating
+ * hashes in deployment configuration.
+ */
+export const getPasskeyOrigins = () => {
+  const webOrigin = normalizeOrigin(appEnv.APP_URL);
+  if (!webOrigin) return undefined;
+
+  return mergeOrigins([webOrigin], getAndroidPasskeyOrigins());
+};
+
+/**
+ * Build trusted origins with Vercel-aware defaults and optional additions.
+ * AUTH_TRUSTED_ORIGINS keeps its replacement semantics, while
+ * AUTH_ADDITIONAL_TRUSTED_ORIGINS is merged into either the override or the defaults.
+ */
+export const getTrustedOrigins = (enabledSSOProviders: string[]) => {
+  const additionalOrigins = parseTrustedOrigins(authEnv.AUTH_ADDITIONAL_TRUSTED_ORIGINS);
+  const originsFromEnv = parseTrustedOrigins(authEnv.AUTH_TRUSTED_ORIGINS);
+
+  if (originsFromEnv?.length) {
+    return mergeOrigins(originsFromEnv, additionalOrigins);
+  }
+
+  const defaults = [
+    normalizeOrigin(appEnv.APP_URL),
+    normalizeOrigin(process.env.VERCEL_URL),
+    normalizeOrigin(process.env.VERCEL_BRANCH_URL),
+    MOBILE_APP_SCHEME,
+    // Add expo URL in development
+    ...(isDev ? [EXPO_DEV_SCHEME] : []),
+  ].filter(Boolean) as string[];
+
+  const providerOrigins = enabledSSOProviders.includes('apple')
+    ? [APPLE_TRUSTED_ORIGIN]
+    : undefined;
+
+  return mergeOrigins(defaults, providerOrigins, additionalOrigins);
+};
+
+/**
+ * Build Better Auth secondaryStorage backed by Redis.
+ * Uses the shared Redis manager to avoid duplicate connections and prefixes keys to prevent clashes.
+ */
+export const createSecondaryStorage = (): BetterAuthOptions['secondaryStorage'] => {
+  const redisConfig = getRedisConfig();
+  if (!isRedisEnabled(redisConfig)) return undefined;
+
+  const secondaryStorageKeyPrefix = 'better-auth:';
+  const atomicCounterKeyPrefix = `${secondaryStorageKeyPrefix}counter:v1:`;
+
+  const buildKey = (key: string) => `${secondaryStorageKeyPrefix}${key}`;
+  const buildAtomicCounterKey = (key: string) => `${atomicCounterKeyPrefix}${key}`;
+
+  const getRedisClient = async () => {
+    const redisClient = await initializeRedis(redisConfig);
+    if (!redisClient) {
+      throw new Error('Redis secondary storage is enabled but failed to initialize');
+    }
+
+    return redisClient;
+  };
+
+  return {
+    delete: async (key: string) => {
+      const redisClient = await getRedisClient();
+      await redisClient.del(buildKey(key));
+    },
+    get: async (key: string) => {
+      const redisClient = await getRedisClient();
+      return (await redisClient.get(buildKey(key))) ?? null;
+    },
+    getAndDelete: async (key: string) => {
+      const redisClient = await getRedisClient();
+      // One Lua operation also supports Redis versions without GETDEL.
+      return redisClient.eval<string | null>(
+        `local value = redis.call('GET', KEYS[1])
+         if value then redis.call('DEL', KEYS[1]) end
+         return value`,
+        1,
+        buildKey(key),
+      );
+    },
+    increment: async (key: string, ttl: number) => {
+      const redisClient = await getRedisClient();
+      /**
+       * Better Auth 1.6 stored rate-limit snapshots as JSON through set(). A separate namespace
+       * prevents 1.7's INCR from colliding with those live keys during a rolling deployment.
+       */
+      return redisClient.eval<number>(
+        `local value = redis.call('INCR', KEYS[1])
+         if value == 1 then redis.call('EXPIRE', KEYS[1], ARGV[1]) end
+         return value`,
+        1,
+        buildAtomicCounterKey(key),
+        ttl,
+      );
+    },
+    set: async (key: string, value: string, ttl?: number) => {
+      const redisClient = await getRedisClient();
+      if (typeof ttl === 'number') {
+        await redisClient.set(buildKey(key), value, { ex: ttl });
+        return;
+      }
+
+      await redisClient.set(buildKey(key), value);
+    },
+  };
+};
