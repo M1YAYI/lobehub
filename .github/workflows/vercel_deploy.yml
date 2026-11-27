@@ -48,48 +48,120 @@ jobs:
       - name: 6. 自动拉取你在 Vercel 填好的数据库等环境变量
         run: vercel pull --yes --environment=production --token=${{ secrets.VERCEL_TOKEN }}
 
-      - name: 6.5 自动绕过 Neon 已废弃的 pg_search 插件报错
+      - name: 6.5 注入 Neon 补丁与 250MB 物理瘦身钩子
         run: |
-          python3 -c "
-          import pathlib, re
+          cat << 'EOF' > .vercel-slim.mjs
+          import fs from 'node:fs';
+          import path from 'node:path';
+
+          const DROP_PATTERNS = [
+            'ffmpeg-static',
+            'file-parse-worker',
+            'sharp-libvips',
+            'packages/database/migrations',
+            '@larksuiteoapi',
+            'pdfjs-dist',
+            'discord.js',
+            'dist/desktop',
+            'dist/mobile',
+            'public/_spa',
+            'playwright',
+            'electron',
+          ];
+
+          function walk(dir, cb) {
+            if (!fs.existsSync(dir)) return;
+            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+              const full = path.join(dir, entry.name);
+              if (entry.isDirectory()) walk(full, cb);
+              else cb(full);
+            }
+          }
+
+          let nftFiles = 0;
+          let removedRefs = 0;
+          let removedMaps = 0;
+
+          // 1. 直接清洗 .next 下所有 .nft.json 函数打包清单，并删掉 .map 调试文件
+          walk('.next', (full) => {
+            if (full.endsWith('.map')) {
+              fs.unlinkSync(full);
+              removedMaps++;
+              return;
+            }
+            if (!full.endsWith('.nft.json')) return;
+            try {
+              const data = JSON.parse(fs.readFileSync(full, 'utf8'));
+              if (!Array.isArray(data.files)) return;
+              const before = data.files.length;
+              data.files = data.files.filter((f) => {
+                const norm = String(f).replace(/\\/g, '/');
+                if (norm.endsWith('.map') || norm.endsWith('.d.ts') || norm.endsWith('.d.mts')) return false;
+                return !DROP_PATTERNS.some((p) => norm.includes(p));
+              });
+              const diff = before - data.files.length;
+              if (diff > 0) {
+                fs.writeFileSync(full, JSON.stringify(data));
+                nftFiles++;
+                removedRefs += diff;
+              }
+            } catch {}
+          });
+
+          // 2. 双保险：把已执行完的迁移脚本与巨型二进制置空，防止被二次追踪
+          let truncated = 0;
+          walk('node_modules/.pnpm', (full) => {
+            const norm = full.replace(/\\/g, '/');
+            if (
+              (norm.includes('ffmpeg-static') && (norm.endsWith('/ffmpeg') || norm.endsWith('/ffprobe'))) ||
+              (norm.includes('sharp-libvips') && norm.includes('.so'))
+            ) {
+              try {
+                fs.writeFileSync(full, '');
+                truncated++;
+              } catch {}
+            }
+          });
+
+          const workerFile = 'dist/file-parse-worker/fileParseWorker.mjs';
+          if (fs.existsSync(workerFile)) {
+            fs.writeFileSync(workerFile, 'export default {};\n');
+            truncated++;
+          }
+
+          walk('packages/database/migrations', (full) => {
+            try {
+              fs.unlinkSync(full);
+              truncated++;
+            } catch {}
+          });
+
+          console.log(`[vercel-slim] Cleaned ${nftFiles} .nft.json files (-${removedRefs} refs), deleted ${removedMaps} .map files, slimmed ${truncated} heavy files.`);
+          EOF
+
+          python3 - << 'PYEOF'
+          import json, pathlib, re
+
+          # 1. 绕过 Neon 已废弃的 pg_search 插件
           for p in pathlib.Path('.').rglob('*.sql'):
               txt = p.read_text(encoding='utf-8', errors='ignore')
               if 'pg_search' in txt:
-                  new_txt = re.sub(r\"name\s*=\s*'pg_search'\", \"name = 'pg_search_skip_neon'\", txt)
+                  new_txt = re.sub(r"name\s*=\s*'pg_search'", "name = 'pg_search_skip_neon'", txt)
                   p.write_text(new_txt, encoding='utf-8')
-                  print('Patched:', p)
-          "
+                  print('Patched SQL:', p)
+
+          # 2. 将物理瘦身钩子挂载到 build:vercel 末尾（编译与建表完成后立刻执行）
+          pkg_path = pathlib.Path('package.json')
+          pkg = json.loads(pkg_path.read_text(encoding='utf-8'))
+          cmd = pkg['scripts']['build:vercel']
+          if '.vercel-slim.mjs' not in cmd:
+              pkg['scripts']['build:vercel'] = cmd + ' && node .vercel-slim.mjs'
+              pkg_path.write_text(json.dumps(pkg, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
+              print('Patched build:vercel:', pkg['scripts']['build:vercel'])
+          PYEOF
 
       - name: 7. 在 GitHub 24GB 机器上进行云端编译
         run: vercel build --prod --token=${{ secrets.VERCEL_TOKEN }}
-
-      - name: 7.5 精简 _middleware 体积（压到 250MB 以下）并打印体积排行
-        run: |
-          TARGET=".vercel/output/functions/_middleware.func"
-          if [ -d "$TARGET" ]; then
-            echo "=== 瘦身前大小 ==="
-            du -shL "$TARGET" || du -sh "$TARGET"
-            echo "=== 瘦身前最大的前 25 项 ==="
-            du -h --max-depth=4 "$TARGET" 2>/dev/null | sort -rh | head -n 25
-
-            echo "=== 清理非运行时文件（.map / .d.ts / 编译器 / 桌面端产物）==="
-            find "$TARGET" -type f \( -name "*.map" -o -name "*.d.ts" -o -name "*.d.mts" \) -delete
-            rm -rf "$TARGET/dist/desktop" 2>/dev/null || true
-            find "$TARGET" -type d \( \
-              -name "@next+swc*" -o -name "swc-*" -o \
-              -name "typescript" -o -name "typescript@*" -o \
-              -name "@esbuild" -o -name "esbuild" -o -name "esbuild@*" -o \
-              -name "playwright*" -o -name "electron*" -o \
-              -name "vitest*" -o -name "eslint*" -o -name "prettier*" \
-            \) -prune -exec rm -rf {} + 2>/dev/null || true
-
-            echo "=== 瘦身后大小 ==="
-            du -shL "$TARGET" || du -sh "$TARGET"
-            echo "=== 瘦身后剩余最大的前 25 项 ==="
-            du -h --max-depth=4 "$TARGET" 2>/dev/null | sort -rh | head -n 25
-          else
-            ls -la .vercel/output/functions/
-          fi
 
       - name: 8. 将编译好的成品直接推送到 Vercel 上线
         run: vercel deploy --prebuilt --prod --token=${{ secrets.VERCEL_TOKEN }}
