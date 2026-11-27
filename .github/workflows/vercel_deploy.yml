@@ -44,6 +44,18 @@ jobs:
       - name: 6. 自动拉取你在 Vercel 填好的数据库等环境变量
         run: vercel pull --yes --environment=production --token=${{ secrets.VERCEL_TOKEN }}
 
+      - name: 6.5 自动绕过 Neon 已废弃的 pg_search 插件报错
+        run: |
+          python3 -c "
+          import pathlib, re
+          for p in pathlib.Path('.').rglob('*.sql'):
+              txt = p.read_text(encoding='utf-8', errors='ignore')
+              if 'pg_search' in txt:
+                  new_txt = re.sub(r\"name\s*=\s*'pg_search'\", \"name = 'pg_search_skip_neon'\", txt)
+                  p.write_text(new_txt, encoding='utf-8')
+                  print('Patched:', p)
+          "
+
       - name: 7. 在 GitHub 24GB 机器上进行云端编译
         run: vercel build --prod --token=${{ secrets.VERCEL_TOKEN }}
 
