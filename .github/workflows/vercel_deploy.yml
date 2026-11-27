@@ -12,6 +12,8 @@ env:
   VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
   VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
   NODE_OPTIONS: "--max-old-space-size=14336"
+  FTS_SEARCH_PROVIDER: pg_like
+
 
 jobs:
   Deploy-Production:
