@@ -1,0 +1,51 @@
+name: Vercel Prebuilt Deploy
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - canary
+      - master
+
+env:
+  VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+  VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+  NODE_OPTIONS: "--max-old-space-size=14336"
+
+jobs:
+  Deploy-Production:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1. 额外挂载 8GB 交换空间（凑齐 24GB 内存防爆）
+        run: |
+          sudo fallocate -l 8G /swapfile_extra || true
+          sudo chmod 600 /swapfile_extra || true
+          sudo mkswap /swapfile_extra || true
+          sudo swapon /swapfile_extra || true
+          free -h
+
+      - name: 2. 拉取仓库源码
+        uses: actions/checkout@v4
+
+      - name: 3. 配置 Node 22 环境
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 4. 配置 Bun 环境
+        uses: oven-sh/setup-bun@v2
+
+      - name: 5. 启用 pnpm 与安装 Vercel 工具
+        run: |
+          corepack enable
+          npm install --global vercel@latest
+
+      - name: 6. 自动拉取你在 Vercel 填好的数据库等环境变量
+        run: vercel pull --yes --environment=production --token=${{ secrets.VERCEL_TOKEN }}
+
+      - name: 7. 在 GitHub 24GB 机器上进行云端编译
+        run: vercel build --prod --token=${{ secrets.VERCEL_TOKEN }}
+
+      - name: 8. 将编译好的成品直接推送到 Vercel 上线
+        run: vercel deploy --prebuilt --prod --token=${{ secrets.VERCEL_TOKEN }}
