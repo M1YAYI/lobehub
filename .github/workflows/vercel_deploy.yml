@@ -48,7 +48,7 @@ jobs:
       - name: 6. 自动拉取你在 Vercel 填好的数据库等环境变量
         run: vercel pull --yes --environment=production --token=${{ secrets.VERCEL_TOKEN }}
 
-      - name: 6.5 注入 Neon 补丁与 250MB 物理瘦身钩子
+      - name: 6.5 注入 Neon 补丁与 250MB 终极瘦身钩子（含裁剪多余外语包）
         run: |
           cat << 'EOF' > .vercel-slim.mjs
           import fs from 'node:fs';
@@ -67,7 +67,45 @@ jobs:
             'public/_spa',
             'playwright',
             'electron',
+            '/@opentelemetry/',
+            '@opentelemetry+',
           ];
+
+          const KEEP_LOCALES = new Set(['zh-CN', 'en-US']);
+
+          function shouldDropRef(rawPath) {
+            const norm = String(rawPath).replace(/\\/g, '/');
+            const lower = norm.toLowerCase();
+
+            // 1. 删掉所有调试映射、TS类型声明、说明文档、旧版字体
+            if (
+              lower.endsWith('.map') ||
+              lower.endsWith('.d.ts') ||
+              lower.endsWith('.d.mts') ||
+              lower.endsWith('.d.cts') ||
+              lower.endsWith('.md') ||
+              lower.endsWith('.markdown') ||
+              lower.endsWith('.ttf') ||
+              lower.endsWith('.eot') ||
+              lower.endsWith('.woff') ||
+              lower.includes('/readme') ||
+              lower.includes('/changelog') ||
+              lower.includes('/license') ||
+              lower.includes('/__tests__/') ||
+              lower.includes('/docs/')
+            ) {
+              return true;
+            }
+
+            // 2. 裁剪多余外语包（只保留 zh-CN 和 en-US）
+            const localeMatch = norm.match(/(?:^|\/)locales\/([^/]+)\//);
+            if (localeMatch && !KEEP_LOCALES.has(localeMatch[1])) {
+              return true;
+            }
+
+            // 3. 剔除重型非聊天依赖包
+            return DROP_PATTERNS.some((p) => norm.includes(p));
+          }
 
           function walk(dir, cb) {
             if (!fs.existsSync(dir)) return;
@@ -82,7 +120,7 @@ jobs:
           let removedRefs = 0;
           let removedMaps = 0;
 
-          // 1. 直接清洗 .next 下所有 .nft.json 函数打包清单，并删掉 .map 调试文件
+          // 清洗 .next 下所有 .nft.json 清单
           walk('.next', (full) => {
             if (full.endsWith('.map')) {
               fs.unlinkSync(full);
@@ -94,11 +132,7 @@ jobs:
               const data = JSON.parse(fs.readFileSync(full, 'utf8'));
               if (!Array.isArray(data.files)) return;
               const before = data.files.length;
-              data.files = data.files.filter((f) => {
-                const norm = String(f).replace(/\\/g, '/');
-                if (norm.endsWith('.map') || norm.endsWith('.d.ts') || norm.endsWith('.d.mts')) return false;
-                return !DROP_PATTERNS.some((p) => norm.includes(p));
-              });
+              data.files = data.files.filter((f) => !shouldDropRef(f));
               const diff = before - data.files.length;
               if (diff > 0) {
                 fs.writeFileSync(full, JSON.stringify(data));
@@ -108,7 +142,18 @@ jobs:
             } catch {}
           });
 
-          // 2. 双保险：把已执行完的迁移脚本与巨型二进制置空，防止被二次追踪
+          // 物理删掉多余外语包文件夹，双保险防止二次打包
+          let removedLocales = 0;
+          if (fs.existsSync('locales')) {
+            for (const entry of fs.readdirSync('locales', { withFileTypes: true })) {
+              if (entry.isDirectory() && !KEEP_LOCALES.has(entry.name)) {
+                fs.rmSync(path.join('locales', entry.name), { recursive: true, force: true });
+                removedLocales++;
+              }
+            }
+          }
+
+          // 置空巨型二进制与已跑完的建表脚本
           let truncated = 0;
           walk('node_modules/.pnpm', (full) => {
             const norm = full.replace(/\\/g, '/');
@@ -136,7 +181,7 @@ jobs:
             } catch {}
           });
 
-          console.log(`[vercel-slim] Cleaned ${nftFiles} .nft.json files (-${removedRefs} refs), deleted ${removedMaps} .map files, slimmed ${truncated} heavy files.`);
+          console.log(`[vercel-slim] Cleaned ${nftFiles} .nft.json (-${removedRefs} refs), removed ${removedLocales} unused locales, ${removedMaps} .map files, slimmed ${truncated} heavy files.`);
           EOF
 
           python3 - << 'PYEOF'
@@ -150,7 +195,7 @@ jobs:
                   p.write_text(new_txt, encoding='utf-8')
                   print('Patched SQL:', p)
 
-          # 2. 将物理瘦身钩子挂载到 build:vercel 末尾（编译与建表完成后立刻执行）
+          # 2. 将终极瘦身钩子挂载到 build:vercel 末尾
           pkg_path = pathlib.Path('package.json')
           pkg = json.loads(pkg_path.read_text(encoding='utf-8'))
           cmd = pkg['scripts']['build:vercel']
