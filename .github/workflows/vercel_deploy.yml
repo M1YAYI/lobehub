@@ -13,7 +13,7 @@ env:
   VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
   NODE_OPTIONS: "--max-old-space-size=14336"
   FTS_SEARCH_PROVIDER: pg_like
-
+  VERCEL_ANALYZE_BUILD_OUTPUT: "1"
 
 jobs:
   Deploy-Production:
@@ -60,6 +60,34 @@ jobs:
 
       - name: 7. 在 GitHub 24GB 机器上进行云端编译
         run: vercel build --prod --token=${{ secrets.VERCEL_TOKEN }}
+
+      - name: 7.5 精简 _middleware 体积（压到 250MB 以下）并打印体积排行
+        run: |
+          TARGET=".vercel/output/functions/_middleware.func"
+          if [ -d "$TARGET" ]; then
+            echo "=== 瘦身前大小 ==="
+            du -shL "$TARGET" || du -sh "$TARGET"
+            echo "=== 瘦身前最大的前 25 项 ==="
+            du -h --max-depth=4 "$TARGET" 2>/dev/null | sort -rh | head -n 25
+
+            echo "=== 清理非运行时文件（.map / .d.ts / 编译器 / 桌面端产物）==="
+            find "$TARGET" -type f \( -name "*.map" -o -name "*.d.ts" -o -name "*.d.mts" \) -delete
+            rm -rf "$TARGET/dist/desktop" 2>/dev/null || true
+            find "$TARGET" -type d \( \
+              -name "@next+swc*" -o -name "swc-*" -o \
+              -name "typescript" -o -name "typescript@*" -o \
+              -name "@esbuild" -o -name "esbuild" -o -name "esbuild@*" -o \
+              -name "playwright*" -o -name "electron*" -o \
+              -name "vitest*" -o -name "eslint*" -o -name "prettier*" \
+            \) -prune -exec rm -rf {} + 2>/dev/null || true
+
+            echo "=== 瘦身后大小 ==="
+            du -shL "$TARGET" || du -sh "$TARGET"
+            echo "=== 瘦身后剩余最大的前 25 项 ==="
+            du -h --max-depth=4 "$TARGET" 2>/dev/null | sort -rh | head -n 25
+          else
+            ls -la .vercel/output/functions/
+          fi
 
       - name: 8. 将编译好的成品直接推送到 Vercel 上线
         run: vercel deploy --prebuilt --prod --token=${{ secrets.VERCEL_TOKEN }}
